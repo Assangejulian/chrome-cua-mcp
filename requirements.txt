@@ -1,0 +1,10 @@
+# Windows, Python 3.11. Versions are the ones the project is developed and tested with.
+# Engine, MCP server, floating command bar, tests:
+numpy==2.4.6
+pillow==13.0.0
+mss==10.2.0
+pyperclip==1.11.0
+pywin32==312
+requests==2.34.2
+# Only scripts/m1_record_chrome.py (recording your own clicks as training data):
+pynput==1.8.2

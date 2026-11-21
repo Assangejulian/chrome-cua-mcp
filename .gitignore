@@ -1,0 +1,42 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights and local runtime binaries (GBs; fetch separately)
+models/
+tools/
+*.gguf
+*.safetensors
+
+# Run outputs: evaluation data, logs, real screen captures, file backups
+artifacts/
+data/
+m3_runs/
+m35_runs/
+*.log
+
+# Managed-Chrome profile: cookies and login state
+profiles/
+
+# Working notes between sessions (local only)
+docs/handoff/
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+
+# Secrets and local environment
+.env
+.env.*
+
+# Node (scripts/*.mjs helpers)
+node_modules/
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

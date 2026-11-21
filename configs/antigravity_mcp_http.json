@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "chrome-pilot-cua": {
+      "url": "http://127.0.0.1:18390/mcp"
+    }
+  }
+}
