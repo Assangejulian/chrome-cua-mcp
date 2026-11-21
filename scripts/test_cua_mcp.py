@@ -947,6 +947,12 @@ def test_ui_interactions() -> None:
         with patch.object(cpp.pyperclip, "copy") as fake_copy:
             click(menu.rows["http"])
         assert fake_copy.call_count == 1 and cpp.PopupMenu.current is None and panel.status_label.cget("text") == "已复制"
+        assert json.loads(fake_copy.call_args.args[0])["mcpServers"]["chrome-pilot-cua"]["url"].endswith("/mcp")
+        with patch.object(cpp.pyperclip, "copy") as fake_copy:
+            panel._copy_mcp("stdio")
+        stdio_cfg = json.loads(fake_copy.call_args.args[0])["mcpServers"]["chrome-pilot-cua"]
+        assert Path(stdio_cfg["command"]).is_file() and Path(stdio_cfg["command"]).name.lower() == "python.exe", "config must name a console python that exists here"
+        assert Path(stdio_cfg["args"][0]) == PROJECT_ROOT / "scripts" / "chrome_cua_mcp.py" and stdio_cfg["args"][1] == "--stdio", "config must point at this checkout"
         panel._clear_status()
         assert cpp._brief_reason("触发高风险保护词「支付」，执行前需人工确认。") == "触发高风险保护词「支付」"
         assert cpp._brief_reason("目标为密码输入框，需人工确认后才能操作。") == "目标为密码输入框"

@@ -28,7 +28,7 @@
 | 项目 | 结果 | 说明 |
 | --- | --- | --- |
 | 托管模式一次观察 | 2–3 ms | 不截图时 |
-| 本地模型一次定位或读屏 | 约 0.5–0.7 s | 模型已加载；首次加载另需约 2–3 s（文件已在系统缓存里时） |
+| 本地模型一次定位或读屏 | 约 0.5–0.7 s | 模型已加载；首次加载另需约 2–3 s，刚装完第一次用实测约 19 s（单次） |
 | 桌面模式 OCR | 约 0.7 s | 整窗 |
 | 自采真实 Chrome 留出集：点击落框 / 缺失目标拒识 | 103/120、80/80 | 与训练数据同批采集，偏乐观 |
 | Venus 中文定位题（没见过的页面）：点击落框 / 缺失目标拒识 | 105/240、22/80 | 泛化明显变差 |
@@ -38,7 +38,7 @@
 - **适合**：上层模型负责拆任务和核对结果，本工具负责在托管 Chrome 里按 DOM 执行；需要看图时本地模型兜底；高危动作由人确认。
 - **不适合**：无人值守的长链任务；纯视觉操作陌生网站；拖拽、画图、滑块（动作协议里没有按住拖动）。
 - **没有验证过**：除 Codex、Antigravity 以外的 MCP 客户端；上层模型实际节省了多少 token；Windows 10 和其他显卡。
-- **微调权重没有随仓库发布**。`m0_setup_local.py` 能下载官方基座的 GGUF，但基座不按本项目的动作协议输出（协议判分 0/24），视觉定位基本不可用；不依赖模型的 DOM 路径不受影响。要用视觉功能，需要按[训练](#模型训练)一节自己训练并导出。
+- **视觉功能是可选的**：不装模型时，托管模式下按 DOM 操作网页照常可用；`cua_ask_screen`、`cua_locate` 和自然语言定位需要模型。
 
 ## 环境要求
 
@@ -50,21 +50,25 @@
 
 ```powershell
 git clone https://github.com/Assangejulian/chrome-cua-mcp.git
-cd chrome-cua-mcp
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# 可选：下载 llama.cpp（b12441，CUDA 12.4）和官方基座 GGUF 到 tools/ 与 models/
-.\.venv\Scripts\python.exe .\scripts\m0_setup_local.py
 ```
 
-模型放在 `models/<目录>/` 下，启动时按下表自动发现，排在前面的优先：
+放在哪个目录都可以。然后双击文件夹里的 `setup.bat`，它会：
 
-| 悬浮窗里的名字 | 目录 | 模型文件 | 视觉投影文件 |
-| --- | --- | --- | --- |
-| M3.5 | `models/m35_gguf/` | `m35-qwen35-2b-Q4_K_M.gguf`（或 `Q8_0`） | `m35-mmproj-f16.gguf` |
-| M3 | `models/m3_gguf/` | `m3-qwen35-2b-Q4_K_M.gguf` | `m3-mmproj-f16.gguf` |
-| 基座 | `models/qwen35_2b_gguf/` | `Qwen3.5-2B-Q4_K_M.gguf` | `mmproj-F16.gguf` |
+1. 在文件夹里建 `.venv` 并安装 [requirements.txt](./requirements.txt) 里的依赖；
+2. 问你要不要装视觉模型。选是的话下载 llama.cpp 运行库（b12441，CUDA 12.4，约 0.7 GB）和[模型权重](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)（约 1.9 GB），校验 SHA-256，占用磁盘约 4 GB；
+3. 按文件夹现在的位置生成 MCP 接入配置，打印出来并写到 `configs/generated_codex.toml` 和 `configs/generated_stdio.json`。
+
+可以重复运行：下载中断会续传，已完成的步骤会跳过；文件夹移动或改名之后再运行一次，就得到新路径的配置。不想被提问可以带参数：`setup.bat --with-model` 或 `setup.bat --no-model`。
+
+手动安装等价于：
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe .\scripts\install.py
+```
+
+模型放在 `models/m35_gguf/` 下（`m35-qwen35-2b-Q4_K_M.gguf` 和配套的 `m35-mmproj-f16.gguf`）。它是 `Qwen/Qwen3.5-2B` 的微调版本；官方基座不按本项目的动作协议输出，不能直接替代。
 
 ## 运行
 
@@ -87,21 +91,20 @@ py -3.11 -m venv .venv
 
 **接入上层模型**
 
-Stdio（Codex 的 `config.toml`，路径换成你的克隆位置）：
+Stdio 方式由上层模型自己拉起服务。配置里要写这个文件夹的绝对路径，所以不要手抄，用生成的：
 
-```toml
-[mcp_servers.chrome-pilot-cua]
-command = 'D:\path\to\chrome-cua-mcp\.venv\Scripts\python.exe'
-args = ['D:\path\to\chrome-cua-mcp\scripts\chrome_cua_mcp.py', '--stdio']
+```powershell
+.\.venv\Scripts\python.exe .\scripts\chrome_cua_mcp.py --print-config codex   # 追加到 Codex 的 config.toml
+.\.venv\Scripts\python.exe .\scripts\chrome_cua_mcp.py --print-config json    # 其他客户端用的 mcpServers JSON
 ```
 
-HTTP（悬浮窗或 `--http` 已在运行时）：
+`setup.bat` 结束时打印的就是这份内容；悬浮窗“接入”菜单里的“复制 Stdio 配置”也是按当前位置现生成的。
+
+HTTP 方式连接已经在运行的悬浮窗或 `--http` 服务，与安装位置无关：
 
 ```json
 { "mcpServers": { "chrome-pilot-cua": { "url": "http://127.0.0.1:18390/mcp" } } }
 ```
-
-`configs/` 里是同样的三份配置，其中的绝对路径是作者机器上的，使用前要改；悬浮窗“接入”菜单里的“复制 Stdio 配置”复制的也是这份文件。
 
 ## 工具
 
@@ -134,7 +137,7 @@ HTTP（悬浮窗或 `--http` 已在运行时）：
 .\.venv\Scripts\python.exe -u .\scripts\test_cua_mcp.py
 ```
 
-全量回归约 2 分钟，会启动一个隔离的 Chrome 和本地模型，覆盖 Stdio / HTTP 两种 MCP、提交判定、桌面 OCR、前台保护、悬浮窗交互与动效。需要本地模型文件；界面相关的测试会短暂在屏幕上显示窗口。
+全量回归约 2 分钟，需要先装好视觉模型；会启动一个隔离的 Chrome 和本地模型，覆盖 Stdio / HTTP 两种 MCP、提交判定、桌面 OCR、前台保护、悬浮窗交互与动效。界面相关的测试会短暂在屏幕上显示窗口；机器负载很高时，最后一项屏幕特效测试可能因超时失败，空闲时重跑即可。
 
 ## 模型训练
 
@@ -143,7 +146,7 @@ HTTP（悬浮窗或 `--http` 已在运行时）：
 - [01_任务书_Chrome视觉鼠标操作模型.md](./01_任务书_Chrome视觉鼠标操作模型.md)：最初的工程任务书（动作空间、坐标与 DPI 链路、数据规范、验收标准）。项目后来从“纯视觉模型”转向“DOM 优先、模型兜底”，任务书保留作为背景。
 - [02_从YOLO到VLM后训练实战指南.md](./02_从YOLO到VLM后训练实战指南.md)、[03_LLM与VLM训练全景教学手册.md](./03_LLM与VLM训练全景教学手册.md)：写给有目标检测经验的人的 VLM 微调入门。
 - [notebooks/](./notebooks)：数据准备和 Colab 训练、导出用的 Notebook；由 `scripts/build_colab_notebooks.py`、`scripts/m3_train_colab.py`、`scripts/m35_build_notebook.py` 生成。
-- `scripts/m1_*`、`m3_*`、`m35_*`：采集、数据整理、离线对照和端到端评测脚本。训练数据包和评测原始结果不在仓库里。
+- `scripts/m1_*`、`m3_*`、`m35_*`：采集、数据整理、离线对照和端到端评测脚本。训练数据包和评测原始结果不在仓库里；训练好的权重在 [Releases](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)。
 
 ## 目录
 
@@ -156,7 +159,8 @@ scripts/desktop_perceiver.py  桌面模式的 OCR 与画面感知
 scripts/action_executor.py    带保护的真实键鼠执行
 scripts/test_cua_mcp.py       全量回归
 scripts/record_demo.py        录制上面的演示动图
-configs/                      MCP 接入配置示例
+setup.bat, scripts/install.py 一键安装：依赖、运行库、模型权重、接入配置
+configs/                      MCP 接入配置模板；setup.bat 生成的 generated_* 是填好本机路径的版本
 notebooks/                    训练与数据准备
 ```
 

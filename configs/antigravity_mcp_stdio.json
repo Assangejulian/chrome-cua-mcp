@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "chrome-pilot-cua": {
-      "command": "F:\\GEMINI\\HYDROGEN_1\\chrome-gui-pilot\\.venv\\Scripts\\python.exe",
+      "command": "<INSTALL_DIR>\\.venv\\Scripts\\python.exe",
       "args": [
-        "F:\\GEMINI\\HYDROGEN_1\\chrome-gui-pilot\\scripts\\chrome_cua_mcp.py",
+        "<INSTALL_DIR>\\scripts\\chrome_cua_mcp.py",
         "--stdio"
       ]
     }

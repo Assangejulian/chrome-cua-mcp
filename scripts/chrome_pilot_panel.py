@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pyperclip
 
 from action_schema import ParsedAction
-from chrome_cua_mcp import start_http_mcp_background
+from chrome_cua_mcp import client_config, start_http_mcp_background
 from cua_effects import ComputerUseEffects
 from cua_engine import (
     MODEL_PRESETS,
@@ -1546,11 +1546,11 @@ class ChromePilotPanel:
             self.entry.configure(state="normal")
 
     def _copy_mcp(self, kind: str) -> None:
-        cfg_file = PROJECT_ROOT / "configs" / ("antigravity_mcp_http.json" if kind == "http" else "antigravity_mcp_stdio.json")
-        if cfg_file.is_file():
-            pyperclip.copy(cfg_file.read_text(encoding="utf-8"))
+        if kind == "http":
+            port = int(getattr(self.args, "mcp_port", 18390))
+            pyperclip.copy(client_config("http", url=self.mcp_url if self.mcp_server is not None else f"http://127.0.0.1:{port}/mcp"))
         else:
-            pyperclip.copy(json.dumps({"mcpServers": {"chrome-pilot-cua": {"url": self.mcp_url}}}, indent=2))
+            pyperclip.copy(client_config("stdio"))
         self.show_status("已复制", TEXT_SECONDARY, ttl_ms=2000)
 
     def _refresh_desktop_windows(self, silent: bool = False) -> None:

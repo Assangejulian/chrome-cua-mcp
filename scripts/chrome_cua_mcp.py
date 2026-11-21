@@ -584,6 +584,21 @@ def start_http_mcp_background(
     return server, thread, f"http://{host}:{actual_port}/mcp"
 
 
+def client_config(kind: str = "stdio", fmt: str = "json", url: str = "http://127.0.0.1:18390/mcp") -> str:
+    """MCP client configuration for this checkout, wherever it lives: fmt 'json' (mcpServers) or 'codex' (config.toml)."""
+    if kind == "http":
+        entry: dict[str, Any] = {"url": url}
+    else:
+        python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+        if not python.is_file():  # pythonw has no stdio, so never hand that one out
+            python = Path(sys.executable).with_name("python.exe") if Path(sys.executable).name.lower() == "pythonw.exe" else Path(sys.executable)
+        entry = {"command": str(python), "args": [str(Path(__file__).resolve()), "--stdio"]}
+    if fmt == "codex":
+        lines = [f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in entry.items()]  # JSON strings are valid TOML basic strings
+        return "[mcp_servers.chrome-pilot-cua]\n" + "\n".join(lines) + "\n"
+    return json.dumps({"mcpServers": {"chrome-pilot-cua": entry}}, indent=2, ensure_ascii=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Chrome Pilot CUA dual-transport MCP server.")
     mode = parser.add_mutually_exclusive_group()
@@ -593,7 +608,12 @@ def main() -> int:
     parser.add_argument("--vlm-port", type=int, default=18086)
     parser.add_argument("--profile-dir", type=Path, default=None)
     parser.add_argument("--target-mode", choices=["managed", "desktop"], default="managed")
+    parser.add_argument("--print-config", choices=["json", "codex"], help="Print the Stdio MCP client config for this checkout and exit.")
     args = parser.parse_args()
+    if args.print_config:
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(client_config("stdio", args.print_config))
+        return 0
 
     engine = ChromeCUAEngine(
         profile_dir=args.profile_dir,

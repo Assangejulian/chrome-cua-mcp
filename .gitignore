@@ -40,3 +40,6 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+
+# Written by setup.bat for this machine's install location
+configs/generated_*
