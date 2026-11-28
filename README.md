@@ -56,7 +56,7 @@ git clone https://github.com/Assangejulian/chrome-cua-mcp.git
 放在哪个目录都可以。然后双击文件夹里的 `setup.bat`，它会：
 
 1. 在文件夹里建 `.venv` 并安装 [requirements.txt](./requirements.txt) 里的依赖；
-2. 问你要不要装视觉模型。选是的话下载 llama.cpp 运行库（b12441，CUDA 12.4，约 0.7 GB）和[模型权重](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)（约 1.9 GB），校验 SHA-256，占用磁盘约 4 GB；
+2. 问你要不要装视觉模型。选是的话下载 llama.cpp 运行库（b12441，CUDA 12.4，约 0.7 GB）和[模型权重](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m4-weights-v1)（M4，约 1.82 GiB），校验 SHA-256，占用磁盘约 4 GB；
 3. 按文件夹现在的位置生成 MCP 接入配置，打印出来并写到 `configs/generated_codex.toml` 和 `configs/generated_stdio.json`。
 
 可以重复运行：下载中断会续传，已完成的步骤会跳过；文件夹移动或改名之后再运行一次，就得到新路径的配置。不想被提问可以带参数：`setup.bat --with-model` 或 `setup.bat --no-model`。
@@ -69,7 +69,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe .\scripts\install.py
 ```
 
-模型放在 `models/m35_gguf/` 下（`m35-qwen35-2b-Q4_K_M.gguf` 和配套的 `m35-mmproj-f16.gguf`）。它是 `Qwen/Qwen3.5-2B` 的微调版本；官方基座不按本项目的动作协议输出，不能直接替代。
+模型放在 `models/m4_gguf/` 下（`m4-qwen35-2b-Q4_K_M.gguf` 和配套的 `m4-mmproj-f16.gguf`）。它是 `Qwen/Qwen3.5-2B` 的双通道微调版本（M4）；官方基座不按本项目的动作协议输出，不能直接替代。
 
 ## 运行
 
@@ -145,12 +145,12 @@ HTTP 方式连接已经在运行的悬浮窗或 `--http` 服务，与安装位�
 本地模型是 `Qwen/Qwen3.5-2B` 的 LoRA 微调（语言侧，监督微调），合并后导出为 GGUF（Q4_K_M）和配套的视觉投影文件。
 
 - **M3.5**：训练集 4,148 条、验证集 645 条，在 Colab A100 上训练，输出单行 JSON 动作（`left_click`、`type`、`scroll`、`not_found` 等，坐标 0–1000 归一化）。
-- **M4（双通道 SFT，当前默认）**：扩展至训练集 7,755 条、验证集 1,011 条（7 个数据源去重消歧），注入 `ask_screen` 短文本读屏问答样本（412 训练 / 48 验证）并保持动作 JSON 与纯文本问答零串台；在 Colab L4 上训练 486 步（`notebooks/M4_Colab_A100_Chrome_SFT.ipynb`），导出至 `models/m4_gguf/`。注：`setup.bat` 目前默认拉取已发布的 `m35-weights-v1` 权重包，若需使用 M4 可用上述 Notebook 自行导出或等待后续 `m4-weights-v1` Release。
+- **M4（双通道 SFT，当前默认）**：扩展至训练集 7,755 条、验证集 1,011 条（7 个数据源去重消歧），注入 `ask_screen` 短文本读屏问答样本（412 训练 / 48 验证）并保持动作 JSON 与纯文本问答零串台；在 Colab L4 上训练 486 步（`notebooks/M4_Colab_A100_Chrome_SFT.ipynb`），导出至 `models/m4_gguf/`。`setup.bat` 默认下载已发布的 [m4-weights-v1](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m4-weights-v1) 权重包（旧版 M3.5 权重仍保留在 Releases `m35-weights-v1`）。
 
 - [01_任务书_Chrome视觉鼠标操作模型.md](./01_任务书_Chrome视觉鼠标操作模型.md)：最初的工程任务书（动作空间、坐标与 DPI 链路、数据规范、验收标准）。项目后来从“纯视觉模型”转向“DOM 优先、模型兜底”，任务书保留作为背景。
 - [02_从YOLO到VLM后训练实战指南.md](./02_从YOLO到VLM后训练实战指南.md)、[03_LLM与VLM训练全景教学手册.md](./03_LLM与VLM训练全景教学手册.md)：写给有目标检测经验的人的 VLM 微调入门。
 - [notebooks/](./notebooks)：数据准备和 Colab 训练、导出用的 Notebook；由 `scripts/build_colab_notebooks.py`、`scripts/m3_train_colab.py`、`scripts/m35_build_notebook.py`、`scripts/m4_build_notebook.py` 生成。
-- `scripts/m1_*`、`m3_*`、`m35_*`、`m4_*`、`teacher_*`、`benchmark_cn500.py`：采集、Teacher 数据组装、离线对照和 CN500 端到端评测脚本。训练数据包和评测原始结果不在仓库里；M3.5 权重在 [Releases](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)。
+- `scripts/m1_*`、`m3_*`、`m35_*`、`m4_*`、`teacher_*`、`benchmark_cn500.py`：采集、Teacher 数据组装、离线对照和 CN500 端到端评测脚本。训练数据包和评测原始结果不在仓库里；M4 权重在 [m4-weights-v1](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m4-weights-v1)（M3.5 在 [m35-weights-v1](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)）。
 
 ## 目录
 

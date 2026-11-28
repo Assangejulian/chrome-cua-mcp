@@ -21,11 +21,11 @@ from chrome_cua_mcp import client_config  # noqa: E402
 from cua_engine import DEFAULT_CHROME  # noqa: E402
 from m0_setup_local import download_with_resume, setup_llama_cpp  # noqa: E402
 
-WEIGHTS_URL = "https://github.com/Assangejulian/chrome-cua-mcp/releases/download/m35-weights-v1"
-WEIGHTS_DIR = PROJECT_ROOT / "models" / "m35_gguf"
+WEIGHTS_URL = "https://github.com/Assangejulian/chrome-cua-mcp/releases/download/m4-weights-v1"
+WEIGHTS_DIR = PROJECT_ROOT / "models" / "m4_gguf"
 WEIGHTS = {
-    "m35-mmproj-f16.gguf": "77d7cb2a85629bfeee146d43be07cc54394926e9aeb0822cd7a820b360817289",
-    "m35-qwen35-2b-Q4_K_M.gguf": "2210e7bd00edbec847d72c179971b38c4fa9455bf57cfc5e26bc511bcf3a7da3",
+    "m4-mmproj-f16.gguf": "77d7cb2a85629bfeee146d43be07cc54394926e9aeb0822cd7a820b360817289",
+    "m4-qwen35-2b-Q4_K_M.gguf": "8e821831a1a00b396defc08bf214f17834670d5bbe4f820a1b1dedaa7f589c9c",
 }
 
 
@@ -84,7 +84,7 @@ def main() -> int:
             print("  [注意] 没有找到 nvidia-smi。llama.cpp 用的是 CUDA 版本，没有 NVIDIA 显卡时视觉功能无法启动。")
         print("llama.cpp 运行库：")
         setup_llama_cpp()
-        print("模型权重（M3.5，Q4_K_M）：")
+        print("模型权重（M4，Q4_K_M）：")
         fetch_weights()
         vision = "已安装"
     else:
