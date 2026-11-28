@@ -227,7 +227,7 @@ def check_corner_failsafe() -> bool:
     """Return True if cursor is pushed into top-left corner (0..4, 0..4) emergency stop zone."""
     pt = wintypes.POINT()
     ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x <= 4 and pt.y <= 4
+    return 0 <= pt.x <= 4 and 0 <= pt.y <= 4
 
 
 def execute_action(action: ParsedAction, hwnd: int, expected_roi: Rect, dry_run: bool = False) -> tuple[bool, str]:

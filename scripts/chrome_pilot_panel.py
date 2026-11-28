@@ -1210,6 +1210,10 @@ class ChromePilotPanel:
         if enable_mcp and self.mcp_server is None:
             self.root.after(20, lambda: self.show_status(self.mcp_url, AMBER, ttl_ms=6000))
         self.root.update_idletasks()
+        try:
+            self.engine.panel_hwnd = int(ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id())
+        except Exception:
+            self.engine.panel_hwnd = int(self.root.winfo_id() or 0)
         self._center_top()
         apply_win11_rounded_corners(self.root)
         self.glass = apply_glass_material(self.root)
@@ -1590,6 +1594,8 @@ class ChromePilotPanel:
         managed_hwnd = getattr(getattr(self, "engine", None), "chrome", None)
         managed_id = managed_hwnd.hwnd if managed_hwnd is not None else 0
         self.desktop_windows = [w for w in find_chrome_windows() if not managed_id or w.hwnd != managed_id]
+        if self.target_mode == "os":
+            return
         if not self.desktop_windows:
             self.selected_hwnd = 0
             if not silent:
@@ -2162,6 +2168,13 @@ class ChromePilotPanel:
             fut = self.worker.submit(self._worker_managed, inst)
             self._watch(fut, self._on_managed_done)
 
+    def _capture_confirm_frame(self) -> Image.Image:
+        if self.engine._is_desktop_like():
+            _, raw_img = self.engine._capture_desktop_window(focus=False)
+            return raw_img
+        _, raw_img = self.engine.chrome.capture_full_window()
+        return raw_img
+
     def _worker_managed(self, inst: str) -> dict[str, Any]:
         self.engine.grounder.set_model(self.model_choice)
         url_match = inst.strip()
@@ -2176,12 +2189,12 @@ class ChromePilotPanel:
             loc = self.engine.locate(inst, zoom=False)
             if loc.get("action") in {None, "not_found"}:
                 return loc
-            info, raw_img = self.engine.chrome.capture_full_window()
+            raw_img = self._capture_confirm_frame()
             crop = self._crop_crosshair(raw_img, loc.get("coordinate"))
             return {"_need_confirm": True, "instruction": inst, "loc": loc, "crop": crop}
         res = self.engine.act(instruction=inst, strategy="hybrid", auto_heal=True)
         if res.get("status") == "needs_human_confirmation":
-            info, raw_img = self.engine.chrome.capture_full_window()
+            raw_img = self._capture_confirm_frame()
             crop = self._crop_crosshair(raw_img, res.get("coordinate"))
             return {"_need_confirm": True, "instruction": inst, "red_tier": True, "res": res, "crop": crop}
         return res
@@ -2217,7 +2230,11 @@ class ChromePilotPanel:
             return
 
         st = data.get("status")
-        if st == "not_found" or data.get("action") == "not_found":
+        if st == "aborted":
+            self.effects.deactivate()
+            self._flash_border(BORDER_DEFAULT, 0)
+            self.show_status("已停止", TEXT_SECONDARY)
+        elif st == "not_found" or data.get("action") == "not_found":
             self.effects.deactivate()
             self._flash_border(BORDER_DEFAULT, 0)
             self.show_status(data.get("reason") or "未找到目标", EMERALD)
@@ -2248,24 +2265,33 @@ class ChromePilotPanel:
             self.show_status("未找到桌面 Chrome", AMBER, ttl_ms=3500)
             return
         self.show_status("识别中…", CYAN)
-        self.root.withdraw()
-        self.root.after(180, lambda: self._launch_desktop_worker(self.selected_hwnd, inst))
+        self._launch_desktop_worker(self.selected_hwnd, inst)
 
     def _launch_desktop_worker(self, hwnd: int, inst: str) -> None:
         def work() -> dict[str, Any]:
             res = self.engine.predict_desktop_window(hwnd, inst, model_label=self.model_choice)
+            if res.get("aborted") or self.engine.abort_event.is_set():
+                return {"aborted": True, "auto_executed": False, **res}
             parsed = res["parsed"]
             policy = evaluate_policy(inst)
             if parsed is not None and parsed.action not in {"not_found", "done"} and self.exec_mode == "auto" and policy.tier == "green":
+                if self.engine.abort_event.is_set():
+                    return {"aborted": True, "auto_executed": False, **res}
                 ok, reason = self.engine.execute_desktop_pending(res["info"], res["frame"], parsed)
+                if reason == "aborted_by_user":
+                    return {"aborted": True, "auto_executed": False, "ok": False, "reason": reason, **res}
                 return {"auto_executed": True, "ok": ok, "reason": reason, **res}
             return {"auto_executed": False, "policy": policy, **res}
 
         fut = self.worker.submit(work)
-        self.root.deiconify()
         self._watch(fut, self._on_desktop_done)
 
     def _on_desktop_done(self, data: dict[str, Any]) -> None:
+        if data.get("aborted"):
+            self.effects.deactivate()
+            self._flash_border(BORDER_DEFAULT, 0)
+            self.show_status("已停止", TEXT_SECONDARY)
+            return
         parsed: Optional[ParsedAction] = data.get("parsed")
         elapsed = float(data.get("elapsed_s", 0.0))
         if parsed is None:
@@ -2293,7 +2319,7 @@ class ChromePilotPanel:
         summary = format_human_action(parsed)
         action = _at_mark(summary, data.get("preview_crop"))
         policy = data.get("policy")
-        warning = bool(policy and policy.tier == "red")
+        warning = bool(policy and policy.tier in {"red", "takeover"})
         if warning:
             summary = f"{_brief_reason(policy.reason)} · {summary}"
         if self.exec_mode == "preview":
@@ -2327,13 +2353,11 @@ class ChromePilotPanel:
             self._set_busy(True)
             self.effects.activate()
             self._flash_border(CYAN, 0)
-            self.root.withdraw()
 
             def run_exec() -> tuple[bool, str]:
                 return self.engine.execute_desktop_pending(pd["info"], pd["frame"], pd["parsed"])
 
             def done(res: tuple[bool, str]) -> None:
-                self.root.deiconify()
                 ok, reason = res
                 msg = "完成" if ok else RESULT_MESSAGES.get(reason, reason)
                 self.show_status(msg, EMERALD if ok else DANGER)
@@ -2345,7 +2369,7 @@ class ChromePilotPanel:
                     self.effects.deactivate()
                     self._flash_border(DANGER, 2200)
 
-            self.root.after(150, lambda: self._watch(self.worker.submit(run_exec), done))
+            self._watch(self.worker.submit(run_exec), done)
 
     def on_confirm_cancel(self) -> None:
         self._hide_confirm()
