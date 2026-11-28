@@ -10,6 +10,7 @@ import secrets
 import sys
 import threading
 from typing import Any
+import urllib.parse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -490,6 +491,32 @@ def run_stdio(engine: ChromeCUAEngine) -> int:
     return 0
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    return hostname.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_local_headers(headers: Any) -> tuple[int, str] | None:
+    host_hdr = headers.get("Host")
+    if host_hdr is not None:
+        try:
+            host_name = urllib.parse.urlsplit(f"http://{host_hdr.strip()}").hostname
+        except ValueError:
+            return 403, "Forbidden Host header"
+        if not _is_loopback_host(host_name):
+            return 403, "Forbidden Host header"
+    origin_hdr = headers.get("Origin")
+    if origin_hdr is not None:
+        try:
+            parsed = urllib.parse.urlsplit(origin_hdr.strip())
+        except ValueError:
+            return 403, "Forbidden Origin header"
+        if parsed.scheme.lower() not in {"http", "https"} or not _is_loopback_host(parsed.hostname):
+            return 403, "Forbidden Origin header"
+    return None
+
+
 def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: int = 18390) -> ThreadingHTTPServer:
     """Create a localhost Streamable HTTP MCP 2025-03-26 server."""
     core = MCPServerCore(engine)
@@ -508,7 +535,17 @@ def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: i
             self.end_headers()
             self.wfile.write(raw)
 
+        def _reject_if_bad_origin(self) -> bool:
+            err = _validate_local_headers(self.headers)
+            if err is not None:
+                code, msg = err
+                self._send_json(code, {"error": msg})
+                return True
+            return False
+
         def do_GET(self) -> None:
+            if self._reject_if_bad_origin():
+                return
             if self.path == "/health":
                 self._send_json(200, {"ok": True, **SERVER_INFO, **engine.get_status()})
                 return
@@ -523,11 +560,24 @@ def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: i
             self.end_headers()
 
         def do_POST(self) -> None:
+            if self._reject_if_bad_origin():
+                return
             if self.path != "/mcp":
                 self.send_response(404)
                 self.end_headers()
                 return
-            length = int(self.headers.get("Content-Length", "0"))
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                self._send_json(415, {"error": "Unsupported Media Type: expected application/json"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid Content-Length"}})
+                return
+            if length < 0 or length > 10 * 1024 * 1024:
+                self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Content-Length out of range"}})
+                return
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8"))
@@ -550,6 +600,9 @@ def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: i
                 resps = [r for r in (core.handle_message(item, session_id=sid) for item in payload) if r is not None]
                 if not resps:
                     self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    for k, v in extra_headers.items():
+                        self.send_header(k, v)
                     self.end_headers()
                     return
                 self._send_json(200, resps, headers=extra_headers)
@@ -558,6 +611,7 @@ def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: i
             resp = core.handle_message(payload, session_id=sid)
             if resp is None:
                 self.send_response(202)
+                self.send_header("Content-Length", "0")
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
                 self.end_headers()
@@ -565,6 +619,8 @@ def create_http_server(engine: ChromeCUAEngine, host: str = "127.0.0.1", port: i
             self._send_json(200, resp, headers=extra_headers)
 
         def do_DELETE(self) -> None:
+            if self._reject_if_bad_origin():
+                return
             if self.path != "/mcp":
                 self.send_response(404)
                 self.end_headers()

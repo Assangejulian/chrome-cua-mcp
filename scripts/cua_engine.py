@@ -1077,6 +1077,78 @@ class ManagedChromeSession:
         snap["frame_size"] = [w_dwm, h_dwm]
         return snap
 
+    def extract_viewport_text(self, max_chars: int = 4000) -> str:
+        """Extract visible text currently intersecting the viewport (including open shadow DOM)."""
+        self.ensure_started()
+        assert self.cdp is not None
+        js = r"""((maxChars) => {
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  if (vw <= 0 || vh <= 0) return '';
+  const allRoots = [document];
+  const seenRoots = new Set([document]);
+  function collectRoots(root, depth = 0) {
+    if (!root || depth > 8 || !root.querySelectorAll) return;
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot && !seenRoots.has(el.shadowRoot)) {
+        seenRoots.add(el.shadowRoot);
+        allRoots.push(el.shadowRoot);
+        collectRoots(el.shadowRoot, depth + 1);
+      }
+    }
+  }
+  collectRoots(document, 0);
+
+  function elHidden(el) {
+    let cur = el;
+    let steps = 0;
+    while (cur && steps < 16) {
+      if (cur.nodeType === 1) {
+        const tag = cur.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return true;
+        const st = getComputedStyle(cur);
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0.05) return true;
+      }
+      cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host) || null;
+      steps++;
+    }
+    return false;
+  }
+
+  const parts = [];
+  let total = 0;
+  for (const root of allRoots) {
+    const startNode = (root === document) ? (document.body || document.documentElement) : root;
+    if (!startNode) continue;
+    const walker = document.createTreeWalker(startNode, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const txt = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+      if (!txt) continue;
+      const parent = node.parentElement;
+      if (parent && elHidden(parent)) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      let visibleInVp = false;
+      for (const r of range.getClientRects()) {
+        if (r.width >= 1 && r.height >= 1 && r.right > 0 && r.left < vw && r.bottom > 0 && r.top < vh) {
+          visibleInVp = true;
+          break;
+        }
+      }
+      if (visibleInVp) {
+        parts.push(txt);
+        total += txt.length + 1;
+        if (total >= maxChars) break;
+      }
+    }
+    if (total >= maxChars) break;
+  }
+  return parts.join(' ').slice(0, maxChars);
+})"""
+        res = self.cdp.evaluate(f"({js})({int(max_chars)})")
+        return str(res or "")
+
     def navigate(self, url: str, timeout_s: float = 15.0) -> dict[str, Any]:
         self.ensure_started()
         assert self.cdp is not None
@@ -1121,9 +1193,8 @@ class ManagedChromeSession:
         self._connect_target(tid)
         return {"tab_id": tid, "tabs": self.list_tabs()}
 
-    def switch_tab(self, tab_ref: str | int) -> dict[str, Any]:
-        self.ensure_started()
-        tabs = self._list_targets()
+    @staticmethod
+    def _resolve_target(tabs: list[dict[str, Any]], tab_ref: str | int) -> dict[str, Any]:
         target = None
         if isinstance(tab_ref, int) or (isinstance(tab_ref, str) and tab_ref.isdigit()):
             idx = int(tab_ref)
@@ -1131,9 +1202,18 @@ class ManagedChromeSession:
                 target = tabs[idx]
         if target is None:
             ref_s = str(tab_ref).lower()
-            target = next((t for t in tabs if t["id"] == tab_ref or ref_s in t.get("title", "").lower() or ref_s in t.get("url", "").lower()), None)
+            target = next(
+                (t for t in tabs if t["id"] == tab_ref or ref_s in t.get("title", "").lower() or ref_s in t.get("url", "").lower()),
+                None,
+            )
         if target is None:
             raise ValueError(f"Tab not found: {tab_ref!r}")
+        return target
+
+    def switch_tab(self, tab_ref: str | int) -> dict[str, Any]:
+        self.ensure_started()
+        tabs = self._list_targets()
+        target = self._resolve_target(tabs, tab_ref)
         urllib.request.urlopen(f"http://127.0.0.1:{self.cdp_port}/json/activate/{target['id']}", timeout=5).read()
         time.sleep(0.25)
         self._connect_target(target["id"])
@@ -1147,10 +1227,7 @@ class ManagedChromeSession:
             raise ValueError("Cannot close the last remaining tab")
         tid = self.active_target_id
         if tab_ref is not None:
-            if isinstance(tab_ref, int) or (isinstance(tab_ref, str) and tab_ref.isdigit()):
-                tid = tabs[int(tab_ref)]["id"]
-            else:
-                tid = next(t["id"] for t in tabs if t["id"] == tab_ref or str(tab_ref) in t.get("title", ""))
+            tid = self._resolve_target(tabs, tab_ref)["id"]
         self.cdp.send("Target.closeTarget", {"targetId": tid})
         time.sleep(0.25)
         self._connect_target()
@@ -1193,7 +1270,7 @@ class ManagedChromeSession:
             for key, action_fn in (
                 ("back", lambda: self.cdp.evaluate("history.back()")),
                 ("reload", lambda: self.cdp.send("Page.reload")),
-                ("new_tab", lambda: self.new_tab("chrome://newtab")),
+                ("new_tab", lambda: self.new_tab("about:blank")),
             ):
                 ctrl = uia_info["controls"].get(key)
                 if ctrl and ctrl["box_px"][0] <= px <= ctrl["box_px"][2] and ctrl["box_px"][1] <= py <= ctrl["box_px"][3]:
@@ -1240,14 +1317,10 @@ class ManagedChromeSession:
 
             def _scroll_state() -> tuple[float, bool]:
                 try:
-                    r = self.cdp.send("Runtime.evaluate", {
-                        "expression": "JSON.stringify({y:window.scrollY||document.documentElement.scrollTop||0,max:Math.max(0,(document.documentElement.scrollHeight||0)-window.innerHeight),x:window.scrollX||0})",
-                        "returnByValue": True})
-                    val = (r.get("result") or {}).get("result") or {}
-                    raw = val.get("value")
-                    if raw:
-                        import json as _json
-                        st = _json.loads(raw)
+                    st = self.cdp.evaluate(
+                        "({y:window.scrollY||document.documentElement.scrollTop||0,max:Math.max(0,(document.documentElement.scrollHeight||0)-window.innerHeight),x:window.scrollX||0})"
+                    )
+                    if isinstance(st, dict):
                         return float(st.get("y", 0.0)), bool(st.get("max", 0) > 4)
                 except Exception:
                     pass
@@ -1270,12 +1343,8 @@ class ManagedChromeSession:
                 return True, "cdp_executed:scroll"
             # fallback 1: wheel at viewport centre (target element may swallow wheel events)
             try:
-                vp = self.cdp.send("Runtime.evaluate", {
-                    "expression": "JSON.stringify({w:window.innerWidth,h:window.innerHeight})", "returnByValue": True})
-                raw = ((vp.get("result") or {}).get("result") or {}).get("value")
-                if raw:
-                    import json as _json
-                    dims = _json.loads(raw)
+                dims = self.cdp.evaluate("({w:window.innerWidth,h:window.innerHeight})")
+                if isinstance(dims, dict) and dims.get("w") and dims.get("h"):
                     cx2, cy2 = float(dims["w"]) / 2.0, float(dims["h"]) / 2.0
                     self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": cx2, "y": cy2, "button": "none"})
                     time.sleep(0.02)
@@ -1293,9 +1362,7 @@ class ManagedChromeSession:
                 pass
             # fallback 2: direct DOM scroll so the action is never a silent no-op
             try:
-                self.cdp.send("Runtime.evaluate", {
-                    "expression": f"window.scrollBy({step_x * ticks:.0f},{total_dy:.0f});'ok'",
-                    "returnByValue": True})
+                self.cdp.evaluate(f"window.scrollBy({step_x * ticks:.0f},{total_dy:.0f});'ok'")
                 return True, "cdp_executed:scroll_js_fallback"
             except Exception:
                 return True, "cdp_executed:scroll_no_effect"
@@ -1809,7 +1876,11 @@ class ChromeCUAEngine:
 
     def _resolve_desktop_window(self, focus: bool = False) -> ChromeWindowInfo:
         if getattr(self, "target_mode", "desktop") == "os":
-            if self.desktop_hwnd > 0 and win32gui.IsWindow(self.desktop_hwnd):
+            if self.desktop_hwnd > 0:
+                if not win32gui.IsWindow(self.desktop_hwnd):
+                    closed_hwnd = self.desktop_hwnd
+                    self.desktop_hwnd = 0
+                    raise RuntimeError(f"target_window_closed: 绑定窗口 hwnd={closed_hwnd} 已关闭，已中止操作以防退回全主屏")
                 chosen = inspect_chrome_window(self.desktop_hwnd)
                 if focus or chosen.is_minimized:
                     chosen = focus_chrome_window(chosen, settle_s=0.18)
@@ -1954,20 +2025,184 @@ class ChromeCUAEngine:
                 except Exception:
                     pass
 
-    def _make_confirm_token(self, instruction: str, element_id: int | None) -> str:
-        sig = hashlib.sha256(f"{instruction}|{element_id}".encode("utf-8")).hexdigest()[:16]
+    @staticmethod
+    def _confirm_target_sig(element_meta: dict[str, Any] | None, matched_rule: str = "") -> str:
+        meta = element_meta or {}
+        label = str(meta.get("text") or meta.get("aria") or meta.get("placeholder") or "").strip()[:120]
+        el_type = str(meta.get("type") or "").strip().lower()
+        return hashlib.sha256(f"{el_type}|{label}|{matched_rule}".encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _find_ocr_element_at_coord(
+        ocr_elements: list[dict[str, Any]],
+        coord: tuple[int, int] | list[int] | None,
+        margin: int = 12,
+    ) -> dict[str, Any] | None:
+        if not coord or len(coord) < 2 or not ocr_elements:
+            return None
+        cx, cy = int(coord[0]), int(coord[1])
+        best_el: dict[str, Any] | None = None
+        best_dist: int | None = None
+        for el in ocr_elements:
+            rn = el.get("rect_norm") or [0, 0, 0, 0]
+            if len(rn) != 4:
+                continue
+            if (rn[0] - margin) <= cx <= (rn[2] + margin) and (rn[1] - margin) <= cy <= (rn[3] + margin):
+                cn = el.get("center_norm") or [(rn[0] + rn[2]) // 2, (rn[1] + rn[3]) // 2]
+                dist = (int(cn[0]) - cx) ** 2 + (int(cn[1]) - cy) ** 2
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_el = el
+        return best_el
+
+    def evaluate_desktop_action_policy(
+        self,
+        instruction: str,
+        info: ChromeWindowInfo,
+        frame: Image.Image,
+        parsed: ParsedAction | None,
+        *,
+        resolved_ocr_el: dict[str, Any] | None = None,
+        gate_reason: str | None = None,
+    ) -> tuple[PolicyDecision, dict[str, Any] | None]:
+        """Evaluate policy on instruction + OCR element at the resolved coordinate (or title/page gate)."""
+        hit_el = resolved_ocr_el
+        if (
+            hit_el is None
+            and parsed is not None
+            and parsed.action in {"left_click", "double_click", "right_click", "type"}
+            and parsed.coordinate is not None
+        ):
+            ocr_reader = getattr(self, "_desktop_ocr", None)
+            if ocr_reader is not None:
+                try:
+                    perc = ocr_reader.recognize(frame, max_elements=60, max_chars=2400)
+                    hit_el = self._find_ocr_element_at_coord(list(perc.get("ocr_elements") or []), parsed.coordinate)
+                except Exception:
+                    hit_el = None
+        return evaluate_policy(instruction, element_meta=hit_el, gate_reason=gate_reason), hit_el
+
+    @staticmethod
+    def _token_base_sig(instruction: str, element_id: int | None, ocr_id: int | None = None) -> str:
+        return hashlib.sha256(f"{instruction}|{element_id}|{ocr_id}".encode("utf-8")).hexdigest()[:16]
+
+    def _make_confirm_token(
+        self,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+        target_sig: str = "",
+        matched_rule: str = "",
+    ) -> str:
+        sig = self._token_base_sig(instruction, element_id, ocr_id=ocr_id)
         token = secrets.token_hex(6)
-        self._pending_confirms[token] = (time.monotonic(), sig)
+        self._pending_confirms[token] = (time.monotonic(), sig, str(target_sig or ""), str(matched_rule or ""))
         return token
 
-    def _consume_confirm_token(self, token: str | None, instruction: str, element_id: int | None) -> bool:
+    def _peek_confirm_token(
+        self,
+        token: str | None,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+    ) -> tuple[str, str] | None:
         if not token or token not in self._pending_confirms:
-            return False
-        ts, sig = self._pending_confirms.pop(token)
+            return None
+        entry = self._pending_confirms[token]
+        if len(entry) >= 4:
+            ts, sig, target_sig, matched_rule = entry[0], entry[1], entry[2], entry[3]
+        else:
+            ts, sig = entry[0], entry[1]
+            target_sig, matched_rule = "", ""
         if time.monotonic() - ts > 600.0:
+            self._pending_confirms.pop(token, None)
+            return None
+        expected = self._token_base_sig(instruction, element_id, ocr_id=ocr_id)
+        if sig != expected:
+            return None
+        return str(target_sig), str(matched_rule)
+
+    def _consume_confirm_token(
+        self,
+        token: str | None,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+        required_target_sig: str = "",
+    ) -> bool:
+        peeked = self._peek_confirm_token(token, instruction, element_id, ocr_id=ocr_id)
+        if peeked is None:
             return False
-        expected = hashlib.sha256(f"{instruction}|{element_id}".encode("utf-8")).hexdigest()[:16]
-        return sig == expected
+        tok_target_sig, _tok_rule = peeked
+        if required_target_sig and tok_target_sig != required_target_sig:
+            return False
+        assert token is not None
+        self._pending_confirms.pop(token, None)
+        return True
+
+    def _verify_resolved_target_policy(
+        self,
+        *,
+        policy_inst: str,
+        element_id: int | None,
+        ocr_id: int | None,
+        confirm_token: str | None,
+        pre_confirmed: tuple[str, str] | None,
+        resolved_meta: dict[str, Any] | None,
+        coordinate: tuple[int, int] | list[int] | None,
+        mode_tag: str | None = None,
+        local_usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Verify resolved target element against policy; require target-bound confirmation if Red-tier."""
+        el_policy = evaluate_policy("", element_meta=resolved_meta)
+        if el_policy.tier == "red":
+            req_sig = self._confirm_target_sig(resolved_meta, el_policy.matched_rule)
+            matched = pre_confirmed is not None and (
+                pre_confirmed[0] == req_sig
+                or (pre_confirmed[0] == "" and pre_confirmed[1] == el_policy.matched_rule)
+            )
+            if matched:
+                if confirm_token:
+                    self._pending_confirms.pop(confirm_token, None)
+                return None
+            tok = self._make_confirm_token(
+                policy_inst,
+                element_id,
+                ocr_id=ocr_id,
+                target_sig=req_sig,
+                matched_rule=el_policy.matched_rule,
+            )
+            audit_rec: dict[str, Any] = {
+                "op": "act",
+                "blocked": "red_tier_post_grounding",
+                "rule": el_policy.matched_rule,
+                "instruction": policy_inst,
+            }
+            if mode_tag:
+                audit_rec["mode"] = mode_tag
+            append_audit(audit_rec)
+            self.task_state = "confirm"
+            self.task_step_label = el_policy.reason[:60]
+            self._emit_status("confirm", el_policy.reason, event_kind="task_alert", play_sound=True)
+            out: dict[str, Any] = {
+                "status": "needs_human_confirmation",
+                "confirm_token": tok,
+                "reason": el_policy.reason,
+                "matched_rule": el_policy.matched_rule,
+            }
+            if mode_tag:
+                out["mode"] = mode_tag
+            if coordinate is not None:
+                out["coordinate"] = list(coordinate)
+            if local_usage is not None:
+                out["local_usage"] = local_usage
+            return out
+        if pre_confirmed is not None and confirm_token:
+            self._pending_confirms.pop(confirm_token, None)
+        return None
 
     def get_status(self, light: bool = False) -> dict[str, Any]:
         """Full status; light=True (per-event UI telemetry) reuses the last GPU/window/tab probe instead of
@@ -2268,6 +2503,46 @@ class ChromeCUAEngine:
             probe["until_matched"] = bool(until_matched)
         return probe
 
+    @staticmethod
+    def _clean_desktop_tab_title(title: str) -> str:
+        s = re.sub(r"\s+", " ", str(title or "")).strip()
+        for suffix in (" - Google Chrome",):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)].strip()
+        for marker in (" - 内存用量", " - Memory usage"):
+            if marker in s:
+                s = s.split(marker, 1)[0].strip()
+        return s.lower()
+
+    @classmethod
+    def _desktop_tab_is_active(
+        cls,
+        chosen_tab: dict[str, Any],
+        window_title: str,
+        refreshed_tabs: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        chosen_clean = cls._clean_desktop_tab_title(str(chosen_tab.get("title", "")))
+        if refreshed_tabs:
+            has_sel = any("selected" in t for t in refreshed_tabs)
+            if has_sel:
+                selected_tabs = [t for t in refreshed_tabs if t.get("selected") is True]
+                if len(selected_tabs) != 1:
+                    return False
+                sel = selected_tabs[0]
+                sel_clean = cls._clean_desktop_tab_title(str(sel.get("title", "")))
+                if not chosen_clean or sel_clean != chosen_clean:
+                    return False
+                same_name_count = sum(
+                    1 for t in refreshed_tabs if cls._clean_desktop_tab_title(str(t.get("title", ""))) == chosen_clean
+                )
+                if same_name_count > 1 and chosen_tab.get("index") is not None and sel.get("index") is not None:
+                    return int(sel["index"]) == int(chosen_tab["index"])
+                return True
+        win_clean = cls._clean_desktop_tab_title(window_title)
+        if not chosen_clean or not win_clean:
+            return False
+        return win_clean == chosen_clean or chosen_clean.startswith(win_clean) or win_clean.startswith(chosen_clean)
+
     def _navigate_desktop(
         self,
         action: str,
@@ -2326,7 +2601,6 @@ class ChromeCUAEngine:
             "back": ["alt", "left"],
             "forward": ["alt", "right"],
             "reload": ["ctrl", "r"],
-            "close_tab": ["ctrl", "w"],
         }
 
         def _try_dwm_shot(win_info: ChromeWindowInfo) -> Image.Image | None:
@@ -2412,21 +2686,84 @@ class ChromeCUAEngine:
             self._attach_screenshot(out, settled_img, include_screenshot, screenshot_format)
             return out
 
+        if action == "close_tab":
+            info = self._resolve_desktop_window(focus=False)
+            if tab_id is None:
+                with self._desktop_io_guard():
+                    if check_corner_failsafe():
+                        raise RuntimeError("failsafe_corner_triggered")
+                    info = self._focus_and_verify_desktop(info, settle_s=0.16)
+                    send_hotkey(["ctrl", "w"])
+                time.sleep(0.35)
+                new_info = inspect_chrome_window(info.hwnd) if win32gui.IsWindow(info.hwnd) else None
+                title_now = new_info.title if new_info else ""
+                self.active_title = title_now
+                return {"mode": "desktop", "action": "close_tab", "title": title_now, "hwnd": info.hwnd}
+
+            tab_data = self._navigate_desktop("list_tabs", None, None, include_screenshot=False)
+            tabs = list(tab_data.get("tabs") or [])
+            chosen_tab = None
+            if isinstance(tab_id, int) or (isinstance(tab_id, str) and tab_id.isdigit()):
+                idx = int(tab_id)
+                if 0 <= idx < len(tabs):
+                    chosen_tab = tabs[idx]
+            if chosen_tab is None:
+                ref_low = str(tab_id).lower()
+                chosen_tab = next((t for t in tabs if ref_low in str(t.get("title", "")).lower()), None)
+            if chosen_tab is None:
+                raise ValueError(f"Desktop tab not found: {tab_id!r}")
+
+            if not self._desktop_tab_is_active(chosen_tab, info.title, tabs):
+                b = chosen_tab["box_px"]
+                with self._desktop_io_guard():
+                    if check_corner_failsafe():
+                        raise RuntimeError("failsafe_corner_triggered")
+                    focused = self._focus_and_verify_desktop(info, settle_s=0.16)
+                    abs_x = focused.dwm_rect.left + (b[0] + b[2]) // 2
+                    abs_y = focused.dwm_rect.top + (b[1] + b[3]) // 2
+                    click_abs(abs_x, abs_y, button="left", count=1)
+                time.sleep(0.30)
+
+            if not win32gui.IsWindow(info.hwnd):
+                raise RuntimeError(f"target_window_closed: Chrome 窗口 hwnd={info.hwnd} 已关闭，已拒绝关闭标签页")
+            cur_info = inspect_chrome_window(info.hwnd)
+            after_tabs: list[dict[str, Any]] | None = None
+            try:
+                after_data = self._navigate_desktop("list_tabs", None, None, include_screenshot=False)
+                after_tabs = list(after_data.get("tabs") or []) or None
+            except Exception:
+                after_tabs = None
+            if not self._desktop_tab_is_active(chosen_tab, cur_info.title, after_tabs):
+                raise RuntimeError(
+                    f"desktop_close_tab_not_active: 目标标签页 {chosen_tab['title']!r} 未成为活动页（当前：{cur_info.title!r}），已拒绝关闭"
+                )
+
+            with self._desktop_io_guard():
+                if check_corner_failsafe():
+                    raise RuntimeError("failsafe_corner_triggered")
+                cur_info = self._focus_and_verify_desktop(cur_info, settle_s=0.12)
+                send_hotkey(["ctrl", "w"])
+            time.sleep(0.35)
+            new_info = inspect_chrome_window(info.hwnd) if win32gui.IsWindow(info.hwnd) else None
+            title_now = new_info.title if new_info else ""
+            self.active_title = title_now
+            return {
+                "mode": "desktop",
+                "action": "close_tab",
+                "closed_tab": chosen_tab["title"],
+                "title": title_now,
+                "hwnd": info.hwnd,
+            }
+
         if action in hotkey_map:
             info = self._resolve_desktop_window(focus=False)
             old_title = info.title
-            before_img = _try_dwm_shot(info) if action != "close_tab" else None
+            before_img = _try_dwm_shot(info)
             with self._desktop_io_guard():
                 if check_corner_failsafe():
                     raise RuntimeError("failsafe_corner_triggered")
                 info = self._focus_and_verify_desktop(info, settle_s=0.16)
                 send_hotkey(hotkey_map[action])
-            if action == "close_tab":
-                time.sleep(0.35)
-                new_info = inspect_chrome_window(info.hwnd) if win32gui.IsWindow(info.hwnd) else None
-                title_now = new_info.title if new_info else ""
-                self.active_title = title_now
-                return {"mode": "desktop", "action": action, "title": title_now, "hwnd": info.hwnd}
             new_info, settled_img, cached_perc = self._wait_desktop_frame_settle(
                 info.hwnd, before_img=before_img, old_title=old_title, min_wait_s=0.3, max_wait_s=3.5
             )
@@ -2458,18 +2795,19 @@ class ChromeCUAEngine:
                 for item in raw_items:
                     if item.get("type") == "TabItem":
                         clean = str(item.get("name", "")).split(" - 内存用量")[0].strip()
-                        tabs.append(
-                            {
-                                "index": len(tabs),
-                                "title": clean,
-                                "box_px": [
-                                    item["left"] - dwm.left,
-                                    item["top"] - dwm.top,
-                                    item["right"] - dwm.left,
-                                    item["bottom"] - dwm.top,
-                                ],
-                            }
-                        )
+                        tab_entry: dict[str, Any] = {
+                            "index": len(tabs),
+                            "title": clean,
+                            "box_px": [
+                                item["left"] - dwm.left,
+                                item["top"] - dwm.top,
+                                item["right"] - dwm.left,
+                                item["bottom"] - dwm.top,
+                            ],
+                        }
+                        if item.get("selected") is not None:
+                            tab_entry["selected"] = bool(item["selected"])
+                        tabs.append(tab_entry)
                 return {"mode": "desktop", "hwnd": info.hwnd, "tabs": tabs}
             except Exception as exc:
                 wins = self._list_desktop_windows()
@@ -3092,6 +3430,7 @@ class ChromeCUAEngine:
         text_hint: str | None = None,
         wait_settle: bool = False,
         include_text: bool = False,
+        _extra_policy_text: str = "",
     ) -> dict[str, Any]:
         mode_tag = getattr(self, "target_mode", "desktop")
         if element_id is not None and ocr_id is None and not text_hint and not instruction and action_json is None:
@@ -3104,7 +3443,8 @@ class ChromeCUAEngine:
         info, raw_img = self._capture_desktop_window(focus=False)
         self.active_title = info.title
         gate = self._check_desktop_title_gate(info.title)
-        inst_str = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+        base_inst = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+        inst_str = " ".join(x for x in (base_inst, _extra_policy_text) if x).strip()
         policy = evaluate_policy(inst_str, element_meta=None, gate_reason=gate)
         if policy.tier == "takeover":
             append_audit({"op": "act", "mode": mode_tag, "blocked": "takeover", "reason": policy.matched_rule, "title": info.title})
@@ -3119,8 +3459,9 @@ class ChromeCUAEngine:
                 "url": self.active_url,
                 "title": info.title,
             }
-        if policy.tier == "red" and not self._consume_confirm_token(confirm_token, inst_str, None):
-            tok = self._make_confirm_token(inst_str, None)
+        pre_confirmed = self._peek_confirm_token(confirm_token, inst_str, element_id, ocr_id=ocr_id)
+        if policy.tier == "red" and pre_confirmed is None:
+            tok = self._make_confirm_token(inst_str, element_id, ocr_id=ocr_id, matched_rule=policy.matched_rule)
             append_audit({"op": "act", "mode": mode_tag, "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_str})
             self.task_state = "confirm"
             self.task_step_label = policy.reason[:60]
@@ -3139,6 +3480,7 @@ class ChromeCUAEngine:
         grounding_source = "m35_vision"
         local_usage = _new_local_usage()
         parsed: Optional[ParsedAction] = None
+        resolved_ocr_el: dict[str, Any] | None = None
 
         if action_json is not None:
             grounding_source = "action_json"
@@ -3155,6 +3497,7 @@ class ChromeCUAEngine:
                     raw_text = json.dumps({"action": "left_click", "coordinate": [cx, cy], "ocr_id": ocr_id}, ensure_ascii=False)
                     parsed = ParsedAction(action="left_click", coordinate=(cx, cy), raw=raw_text)
                     grounding_source = "ocr_id"
+                    resolved_ocr_el = hit
                 elif not instruction:
                     return {
                         "status": "not_found",
@@ -3187,6 +3530,7 @@ class ChromeCUAEngine:
                     )
                     parsed = ParsedAction(action="left_click", coordinate=(cx, cy), raw=raw_text)
                     grounding_source = "ocr_hint"
+                    resolved_ocr_el = el_ocr
                 elif strategy == "ocr" or not instruction:
                     return {
                         "status": "not_found",
@@ -3213,6 +3557,9 @@ class ChromeCUAEngine:
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
+                if self.abort_event.is_set():
+                    self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                    return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                 if parsed is None:
                     self._emit_status("error", "模型输出格式无效", event_kind="status", play_sound=False)
                     return {"status": "invalid_json", "mode": mode_tag, "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
@@ -3230,8 +3577,29 @@ class ChromeCUAEngine:
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
 
+        _el_pol, hit_ocr = self.evaluate_desktop_action_policy(
+            base_inst, info, raw_img, parsed, resolved_ocr_el=resolved_ocr_el
+        )
+        blocked_post = self._verify_resolved_target_policy(
+            policy_inst=inst_str,
+            element_id=element_id,
+            ocr_id=ocr_id,
+            confirm_token=confirm_token,
+            pre_confirmed=pre_confirmed,
+            resolved_meta=hit_ocr,
+            coordinate=parsed.coordinate if parsed is not None else None,
+            mode_tag=mode_tag,
+            local_usage=local_usage,
+        )
+        if blocked_post is not None:
+            return blocked_post
+        token_consumed = True
+
         try:
             with self._desktop_io_guard():
+                if self.abort_event.is_set():
+                    self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                    return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                 if check_corner_failsafe():
                     self.task_state = "error"
                     self._emit_status("error", "已急停（光标在左上角安全区）", event_kind="task_error", play_sound=True)
@@ -3270,6 +3638,9 @@ class ChromeCUAEngine:
                                 "local_usage": local_usage,
                                 "elapsed_s": round(time.perf_counter() - t_start, 4),
                             }
+                        if self.abort_event.is_set():
+                            self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                            return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                         if parsed is None:
                             self._emit_status("error", "模型输出格式无效")
                             return {"status": "invalid_json", "mode": mode_tag, "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
@@ -3285,6 +3656,23 @@ class ChromeCUAEngine:
                                 "local_usage": local_usage,
                                 "elapsed_s": round(time.perf_counter() - t_start, 4),
                             }
+                        _re_pol, re_hit_ocr = self.evaluate_desktop_action_policy(base_inst, info, raw_img, parsed)
+                        blocked_re = self._verify_resolved_target_policy(
+                            policy_inst=inst_str,
+                            element_id=element_id,
+                            ocr_id=ocr_id,
+                            confirm_token=None,
+                            pre_confirmed=pre_confirmed,
+                            resolved_meta=re_hit_ocr,
+                            coordinate=parsed.coordinate,
+                            mode_tag=mode_tag,
+                            local_usage=local_usage,
+                        )
+                        if blocked_re is not None:
+                            return blocked_re
+                if self.abort_event.is_set():
+                    self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                    return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                 exec_ok, exec_status = execute_action(parsed, focused.hwnd, focused.dwm_rect)
         except RuntimeError as exc:
             self._emit_status("error", "目标窗口前景聚焦失败" if mode_tag == "os" else "桌面 Chrome 前景聚焦失败")
@@ -3319,9 +3707,29 @@ class ChromeCUAEngine:
                 except VLMCallError:
                     _accumulate_usage(local_usage, None)
                     parsed_z = None
+                if self.abort_event.is_set():
+                    self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                    return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                 if parsed_z is not None and parsed_z.action == "left_click" and parsed_z.coordinate is not None:
+                    _z_pol, z_hit_ocr = self.evaluate_desktop_action_policy(base_inst, after_info, after_img, parsed_z)
+                    blocked_z = self._verify_resolved_target_policy(
+                        policy_inst=inst_str,
+                        element_id=element_id,
+                        ocr_id=ocr_id,
+                        confirm_token=None,
+                        pre_confirmed=None,
+                        resolved_meta=z_hit_ocr,
+                        coordinate=parsed_z.coordinate,
+                        mode_tag=mode_tag,
+                        local_usage=local_usage,
+                    )
+                    if blocked_z is not None:
+                        return blocked_z
                     try:
                         with self._desktop_io_guard():
+                            if self.abort_event.is_set():
+                                self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
+                                return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                             if not check_corner_failsafe():
                                 focused2 = self._focus_and_verify_desktop(after_info, settle_s=0.16)
                                 exec_ok, exec_status = execute_action(parsed_z, focused2.hwnd, focused2.dwm_rect)
@@ -3422,11 +3830,13 @@ class ChromeCUAEngine:
         wait_settle: bool = False,
         include_text: bool = False,
         scroll_retry: int = 0,
+        _extra_policy_text: str = "",
     ) -> dict[str, Any]:
         if self.abort_event.is_set():
             return {"status": "aborted", "reason": "aborted_by_user"}
         with self._lock:
-            self.reset_abort()
+            if self.abort_event.is_set():
+                return {"status": "aborted", "reason": "aborted_by_user"}
             step_lbl = (
                 instruction
                 or text_hint
@@ -3448,6 +3858,7 @@ class ChromeCUAEngine:
                     text_hint=text_hint,
                     wait_settle=wait_settle,
                     include_text=include_text,
+                    _extra_policy_text=_extra_policy_text,
                 )
 
             t_start = time.perf_counter()
@@ -3472,7 +3883,8 @@ class ChromeCUAEngine:
                 if dom_hit is not None:
                     target_el = dom_hit["element"]["el"]
 
-            inst_for_policy = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+            base_inst = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+            inst_for_policy = " ".join(x for x in (base_inst, _extra_policy_text) if x).strip()
             policy = evaluate_policy(
                 inst_for_policy,
                 element_meta=target_el,
@@ -3489,11 +3901,41 @@ class ChromeCUAEngine:
                     "gate": policy.matched_rule,
                     "url": self.active_url,
                 }
-            token_ok = False
+            pre_confirmed = self._peek_confirm_token(confirm_token, inst_for_policy, element_id, ocr_id=ocr_id)
             if policy.tier == "red":
-                token_ok = self._consume_confirm_token(confirm_token, inst_for_policy, element_id)
-                if not token_ok:
-                    tok = self._make_confirm_token(inst_for_policy, element_id)
+                if target_el is not None:
+                    req_sig = self._confirm_target_sig(target_el, policy.matched_rule)
+                    matched = pre_confirmed is not None and (
+                        pre_confirmed[0] == req_sig
+                        or (pre_confirmed[0] == "" and pre_confirmed[1] == policy.matched_rule)
+                    )
+                    if matched and confirm_token:
+                        self._pending_confirms.pop(confirm_token, None)
+                    else:
+                        tok = self._make_confirm_token(
+                            inst_for_policy,
+                            element_id,
+                            ocr_id=ocr_id,
+                            target_sig=req_sig,
+                            matched_rule=policy.matched_rule,
+                        )
+                        append_audit({"op": "act", "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_for_policy})
+                        self.task_state = "confirm"
+                        self.task_step_label = policy.reason[:60]
+                        self._emit_status("confirm", policy.reason, event_kind="task_alert", play_sound=True)
+                        return {
+                            "status": "needs_human_confirmation",
+                            "confirm_token": tok,
+                            "reason": policy.reason,
+                            "matched_rule": policy.matched_rule,
+                        }
+                elif pre_confirmed is None:
+                    tok = self._make_confirm_token(
+                        inst_for_policy,
+                        element_id,
+                        ocr_id=ocr_id,
+                        matched_rule=policy.matched_rule,
+                    )
                     append_audit({"op": "act", "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_for_policy})
                     self.task_state = "confirm"
                     self.task_step_label = policy.reason[:60]
@@ -3513,6 +3955,10 @@ class ChromeCUAEngine:
             parsed: Optional[ParsedAction] = None
 
             if target_el is not None:
+                if pre_confirmed is not None and confirm_token:
+                    self._pending_confirms.pop(confirm_token, None)
+                if self.abort_event.is_set():
+                    return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                 grounding_source = "dom_id" if element_id is not None else "dom_hint"
                 text_to_type = None
                 if isinstance(action_json, dict) and action_json.get("text"):
@@ -3528,9 +3974,34 @@ class ChromeCUAEngine:
                 self._emit_status("running" if self.task_state == "running" else "idle", f"未找到元素 #{element_id}")
                 return {"status": "not_found", "reason": f"Element id {element_id} not visible in current frame", "local_usage": local_usage}
             elif action_json is not None:
+                if self.abort_event.is_set():
+                    return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                 grounding_source = "action_json"
                 raw_text = _normalize_action_json(action_json)
                 parsed = parse_and_validate_action(raw_text)
+                hit_el = None
+                if parsed.action in {"left_click", "double_click", "right_click", "type"} and parsed.coordinate is not None:
+                    cx, cy = parsed.coordinate
+                    hit_el = next(
+                        (
+                            e
+                            for e in snap.get("elements", [])
+                            if e["rect_norm"][0] <= cx <= e["rect_norm"][2] and e["rect_norm"][1] <= cy <= e["rect_norm"][3]
+                        ),
+                        None,
+                    )
+                blocked_aj = self._verify_resolved_target_policy(
+                    policy_inst=inst_for_policy,
+                    element_id=element_id,
+                    ocr_id=ocr_id,
+                    confirm_token=confirm_token,
+                    pre_confirmed=pre_confirmed,
+                    resolved_meta=hit_el,
+                    coordinate=parsed.coordinate,
+                    local_usage=local_usage,
+                )
+                if blocked_aj is not None:
+                    return blocked_aj
                 exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed, info, raw_img.size)
             else:
                 if not instruction:
@@ -3564,6 +4035,8 @@ class ChromeCUAEngine:
                     snap = self.chrome.extract_dom_snapshot(info, w_dwm, h_dwm, max_elements=60)
 
                 while True:
+                    if self.abort_event.is_set():
+                        return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                     try:
                         raw_text, parsed, infer_s, usage = self.grounder.predict(raw_img, instruction)
                         _accumulate_usage(local_usage, usage)
@@ -3576,6 +4049,8 @@ class ChromeCUAEngine:
                             "local_usage": local_usage,
                             "elapsed_s": round(time.perf_counter() - t_start, 4),
                         }
+                    if self.abort_event.is_set():
+                        return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                     if parsed is None:
                         break
                     if parsed.action == "not_found":
@@ -3621,6 +4096,7 @@ class ChromeCUAEngine:
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
+                hit_el = None
                 if parsed.coordinate is not None:
                     cx, cy = parsed.coordinate
                     self._last_click_coord = (int(cx), int(cy))
@@ -3632,24 +4108,20 @@ class ChromeCUAEngine:
                         ),
                         None,
                     )
-                    if hit_el is not None:
-                        hit_policy = evaluate_policy(instruction, element_meta=hit_el)
-                        if hit_policy.tier == "red" and not token_ok:
-                            token_ok = self._consume_confirm_token(confirm_token, instruction, element_id)
-                        if hit_policy.tier == "red" and not token_ok:
-                            tok = self._make_confirm_token(instruction, element_id)
-                            append_audit({"op": "act", "blocked": "red_tier_post_grounding", "rule": hit_policy.matched_rule, "instruction": instruction})
-                            self.task_state = "confirm"
-                            self.task_step_label = hit_policy.reason[:60]
-                            self._emit_status("confirm", hit_policy.reason, event_kind="task_alert", play_sound=True)
-                            return {
-                                "status": "needs_human_confirmation",
-                                "confirm_token": tok,
-                                "reason": hit_policy.reason,
-                                "matched_rule": hit_policy.matched_rule,
-                                "coordinate": list(parsed.coordinate),
-                                "local_usage": local_usage,
-                            }
+                blocked_post = self._verify_resolved_target_policy(
+                    policy_inst=inst_for_policy,
+                    element_id=element_id,
+                    ocr_id=ocr_id,
+                    confirm_token=confirm_token,
+                    pre_confirmed=pre_confirmed,
+                    resolved_meta=hit_el,
+                    coordinate=parsed.coordinate,
+                    local_usage=local_usage,
+                )
+                if blocked_post is not None:
+                    return blocked_post
+                if self.abort_event.is_set():
+                    return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                 exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed, info, raw_img.size)
                 if exec_ok and parsed.action == "left_click" and strategy == "hybrid" and auto_heal and parsed.coordinate is not None:
                     time.sleep(0.18)
@@ -3666,6 +4138,8 @@ class ChromeCUAEngine:
                     )
                     changed = (after_snap.get("dom_signature") != snap.get("dom_signature")) or effect["effective"]
                     if not changed:
+                        if self.abort_event.is_set():
+                            return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                         try:
                             raw_z, parsed_z, inf_z, uz = self.grounder.predict_zoomed(raw_img, instruction, parsed.coordinate)
                             _accumulate_usage(local_usage, uz)
@@ -3673,7 +4147,32 @@ class ChromeCUAEngine:
                         except VLMCallError:
                             _accumulate_usage(local_usage, None)
                             parsed_z = None
+                        if self.abort_event.is_set():
+                            return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                         if parsed_z is not None and parsed_z.action == "left_click":
+                            hit_el_z = None
+                            if parsed_z.coordinate is not None:
+                                zx, zy = parsed_z.coordinate
+                                hit_el_z = next(
+                                    (
+                                        e
+                                        for e in after_snap.get("elements", []) or snap.get("elements", [])
+                                        if e["rect_norm"][0] <= zx <= e["rect_norm"][2] and e["rect_norm"][1] <= zy <= e["rect_norm"][3]
+                                    ),
+                                    None,
+                                )
+                            blocked_z = self._verify_resolved_target_policy(
+                                policy_inst=inst_for_policy,
+                                element_id=element_id,
+                                ocr_id=ocr_id,
+                                confirm_token=None,
+                                pre_confirmed=None,
+                                resolved_meta=hit_el_z,
+                                coordinate=parsed_z.coordinate,
+                                local_usage=local_usage,
+                            )
+                            if blocked_z is not None:
+                                return blocked_z
                             exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed_z, info, raw_img.size)
                             parsed = parsed_z
                             raw_text = raw_z
@@ -3754,15 +4253,6 @@ class ChromeCUAEngine:
 
         target_inst = spec.get("instruction") or spec.get("target")
         hint = spec.get("text_hint")
-        inst_pol = f"{target_inst or ''} {hint or ''} {text_val}".strip()
-
-        gate = self._check_desktop_title_gate(self.active_title) if self._is_desktop_like() else None
-        policy = evaluate_policy(inst_pol, element_meta=None, gate_reason=gate)
-        if policy.tier == "takeover":
-            return {"status": "needs_human_takeover", "reason": policy.reason, "gate": policy.matched_rule}
-        if policy.tier == "red" and not self._consume_confirm_token(spec.get("confirm_token"), inst_pol, spec.get("element_id")):
-            tok = self._make_confirm_token(inst_pol, spec.get("element_id"))
-            return {"status": "needs_human_confirmation", "confirm_token": tok, "reason": policy.reason, "matched_rule": policy.matched_rule}
 
         click_res = self.act(
             instruction=target_inst,
@@ -3774,9 +4264,12 @@ class ChromeCUAEngine:
             confirm_token=spec.get("confirm_token"),
             include_screenshot=False,
             wait_settle=False,
+            _extra_policy_text=text_val,
         )
         if click_res.get("status") != "ok":
             return click_res
+        if self.abort_event.is_set():
+            return {"status": "aborted", "reason": "aborted_by_user"}
 
         submitted: bool | None = None
         submission_state = "not_requested"
@@ -4138,7 +4631,23 @@ class ChromeCUAEngine:
                     "reason": str(obs_now["auth_or_captcha_gate"]),
                     "scrolls_done": idx,
                 }
-            haystack = f"{obs_now.get('title', '')}\n{obs_now.get('page_text') or obs_now.get('text_excerpt') or ''}"
+            if self._is_desktop_like():
+                haystack = f"{obs_now.get('title', '')}\n{obs_now.get('page_text') or obs_now.get('text_excerpt') or ''}"
+            else:
+                vp_text = ""
+                if getattr(self.chrome, "cdp", None) is not None:
+                    try:
+                        vp_text = self.chrome.extract_viewport_text()
+                    except Exception:
+                        vp_text = ""
+                el_labels = " ".join(
+                    str(e.get(k) or "")
+                    for e in (obs_now.get("elements") or [])
+                    if isinstance(e, dict)
+                    for k in ("text", "aria", "placeholder")
+                    if e.get(k)
+                )
+                haystack = f"{obs_now.get('title', '')}\n{vp_text}\n{el_labels}"
             if targets and self._text_matches_any(haystack, targets):
                 return {"status": "ok", "kind": "scroll_until", "matched": True, "scrolls_done": idx, "url": obs_now.get("url", ""), "title": obs_now.get("title", "")}
             if idx == max_scrolls:
@@ -4330,12 +4839,14 @@ class ChromeCUAEngine:
                 elif kind == "hotkey":
                     res = self.act(
                         action_json={"action": "hotkey", "keys": list(spec.get("keys") or [])},
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
                 elif kind == "type":
                     res = self.act(
                         action_json={"action": "type", "text": str(spec.get("text", ""))},
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
@@ -4347,6 +4858,7 @@ class ChromeCUAEngine:
                             "direction": str(spec.get("direction", "down")),
                             "amount": int(spec.get("amount", 5)),
                         },
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
@@ -4357,6 +4869,7 @@ class ChromeCUAEngine:
                             "coordinate": list(spec.get("coordinate") or [0, 0]),
                             "end_coordinate": list(spec.get("end_coordinate") or spec.get("to") or [0, 0]),
                         },
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
@@ -4526,13 +5039,22 @@ class ChromeCUAEngine:
         instruction: str,
         model_label: str | None = None,
     ) -> dict[str, Any]:
+        if self.abort_event.is_set():
+            return {"aborted": True, "info": None, "frame": None, "raw": "", "parsed": None, "screen_pt": None, "preview_crop": None, "elapsed_s": 0.0}
         with self._lock:
+            if self.abort_event.is_set():
+                return {"aborted": True, "info": None, "frame": None, "raw": "", "parsed": None, "screen_pt": None, "preview_crop": None, "elapsed_s": 0.0}
             if model_label:
                 self.grounder.set_model(model_label)
             t0 = time.perf_counter()
-            info = focus_chrome_window(inspect_chrome_window(hwnd), settle_s=0.18)
-            frame = capture_chrome_window(info)
+            with self._desktop_io_guard():
+                info = focus_chrome_window(inspect_chrome_window(hwnd), settle_s=0.18)
+                frame = capture_chrome_window(info)
+            if self.abort_event.is_set():
+                return {"aborted": True, "info": info, "frame": frame, "raw": "", "parsed": None, "screen_pt": None, "preview_crop": None, "elapsed_s": time.perf_counter() - t0}
             raw_text, parsed, infer_s, _ = self.grounder.predict(frame, instruction)
+            if self.abort_event.is_set():
+                return {"aborted": True, "info": info, "frame": frame, "raw": raw_text, "parsed": parsed, "screen_pt": None, "preview_crop": None, "elapsed_s": time.perf_counter() - t0}
             screen_pt = norm_to_screen(*parsed.coordinate, info.dwm_rect) if (parsed and parsed.coordinate) else None
             preview_crop: Optional[Image.Image] = None
             if parsed is not None and parsed.coordinate is not None:
@@ -4558,14 +5080,23 @@ class ChromeCUAEngine:
             }
 
     def execute_desktop_pending(self, info: ChromeWindowInfo, frame: Image.Image, parsed: ParsedAction) -> tuple[bool, str]:
+        if self.abort_event.is_set():
+            return False, "aborted_by_user"
         with self._lock:
-            if check_corner_failsafe():
-                return False, "failsafe_corner_triggered"
-            try:
-                focused = self._focus_and_verify_desktop(info, settle_s=0.15)
-            except RuntimeError:
-                return False, "chrome_not_foreground"
-            return execute_confirmed_action(focused, frame, parsed)
+            if self.abort_event.is_set():
+                return False, "aborted_by_user"
+            with self._desktop_io_guard():
+                if self.abort_event.is_set():
+                    return False, "aborted_by_user"
+                if check_corner_failsafe():
+                    return False, "failsafe_corner_triggered"
+                try:
+                    focused = self._focus_and_verify_desktop(info, settle_s=0.15)
+                except RuntimeError:
+                    return False, "chrome_not_foreground"
+                if self.abort_event.is_set():
+                    return False, "aborted_by_user"
+                return execute_confirmed_action(focused, frame, parsed)
 
     def close(self) -> None:
         self.request_abort()

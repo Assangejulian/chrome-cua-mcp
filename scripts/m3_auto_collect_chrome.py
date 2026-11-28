@@ -139,6 +139,9 @@ CHINESE_QUERY_POOL = [
 
 UIA_PS_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -165,7 +168,8 @@ while ($true) {
         $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
         $items = New-Object System.Collections.Generic.List[object]
         for ($i = 0; $i -lt $all.Count; $i++) {
-            $c = $all.Item($i).Current
+            $el = $all.Item($i)
+            $c = $el.Current
             if ($c.IsOffscreen) { continue }
             $ct = $c.ControlType.ProgrammaticName
             if ($ct -notmatch 'TabItem|Button|Edit|MenuItem') { continue }
@@ -174,14 +178,21 @@ while ($true) {
             if ($br.Bottom -gt $maxY) { continue }
             $name = if ($null -ne $c.Name) { $c.Name.Trim() } else { '' }
             if (-not $name) { continue }
-            $items.Add(@{
+            $item = @{
                 type = $ct.Replace('ControlType.', '')
                 name = $name
                 left = [int][Math]::Round($br.Left)
                 top = [int][Math]::Round($br.Top)
                 right = [int][Math]::Round($br.Right)
                 bottom = [int][Math]::Round($br.Bottom)
-            })
+            }
+            if ($ct -eq 'ControlType.TabItem') {
+                try {
+                    $sp = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+                    $item['selected'] = [bool]$sp.Current.IsSelected
+                } catch {}
+            }
+            $items.Add($item)
         }
         $json = ConvertTo-Json -InputObject $items -Compress -Depth 4
         [Console]::Out.WriteLine($json)
@@ -550,24 +561,35 @@ class UIAHelper:
 
     def _spawn(self) -> None:
         self.proc = subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", "-"],
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                UIA_PS_SCRIPT,
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
-        self.proc.stdin.write(UIA_PS_SCRIPT + "\n")
-        self.proc.stdin.flush()
         self._lines: queue.Queue[str] = queue.Queue()
         threading.Thread(target=self._pump_stdout, args=(self.proc, self._lines), daemon=True).start()
 
     @staticmethod
     def _pump_stdout(proc: subprocess.Popen, lines: "queue.Queue[str]") -> None:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            lines.put(line)
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception:
+            pass
 
     def query(self, hwnd: int, max_screen_y: int) -> list[dict[str, Any]]:
         assert self.proc.stdin is not None and self.proc.stdout is not None
@@ -1314,15 +1336,23 @@ def launch_chrome_session(
     ]
     if dark_mode:
         cmd.append("--force-dark-mode")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     port_file = profile_dir / "DevToolsActivePort"
+    try:
+        port_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(100):
         wins: list[int] = []
 
         def cb(h: int, _: Any) -> bool:
-            if win32gui.IsWindowVisible(h) and win32gui.GetClassName(h) == "Chrome_WidgetWin_1":
-                if win32process.GetWindowThreadProcessId(h)[1] == proc.pid:
-                    wins.append(h)
+            try:
+                if win32gui.IsWindowVisible(h) and win32gui.GetClassName(h) == "Chrome_WidgetWin_1":
+                    if win32process.GetWindowThreadProcessId(h)[1] == proc.pid:
+                        wins.append(h)
+            except Exception:
+                pass
+            ctypes.windll.kernel32.SetLastError(0)
             return True
 
         win32gui.EnumWindows(cb, None)
