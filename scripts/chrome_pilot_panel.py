@@ -2273,7 +2273,15 @@ class ChromePilotPanel:
             if res.get("aborted") or self.engine.abort_event.is_set():
                 return {"aborted": True, "auto_executed": False, **res}
             parsed = res["parsed"]
-            policy = evaluate_policy(inst)
+            info = res.get("info")
+            frame = res.get("frame")
+            gate = self.engine._check_desktop_title_gate(info.title) if info is not None else None
+            if info is not None and frame is not None:
+                policy, _hit_ocr = self.engine.evaluate_desktop_action_policy(
+                    inst, info, frame, parsed, gate_reason=gate
+                )
+            else:
+                policy = evaluate_policy(inst, gate_reason=gate)
             if parsed is not None and parsed.action not in {"not_found", "done"} and self.exec_mode == "auto" and policy.tier == "green":
                 if self.engine.abort_event.is_set():
                     return {"aborted": True, "auto_executed": False, **res}

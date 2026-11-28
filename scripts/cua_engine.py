@@ -2025,20 +2025,184 @@ class ChromeCUAEngine:
                 except Exception:
                     pass
 
-    def _make_confirm_token(self, instruction: str, element_id: int | None) -> str:
-        sig = hashlib.sha256(f"{instruction}|{element_id}".encode("utf-8")).hexdigest()[:16]
+    @staticmethod
+    def _confirm_target_sig(element_meta: dict[str, Any] | None, matched_rule: str = "") -> str:
+        meta = element_meta or {}
+        label = str(meta.get("text") or meta.get("aria") or meta.get("placeholder") or "").strip()[:120]
+        el_type = str(meta.get("type") or "").strip().lower()
+        return hashlib.sha256(f"{el_type}|{label}|{matched_rule}".encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _find_ocr_element_at_coord(
+        ocr_elements: list[dict[str, Any]],
+        coord: tuple[int, int] | list[int] | None,
+        margin: int = 12,
+    ) -> dict[str, Any] | None:
+        if not coord or len(coord) < 2 or not ocr_elements:
+            return None
+        cx, cy = int(coord[0]), int(coord[1])
+        best_el: dict[str, Any] | None = None
+        best_dist: int | None = None
+        for el in ocr_elements:
+            rn = el.get("rect_norm") or [0, 0, 0, 0]
+            if len(rn) != 4:
+                continue
+            if (rn[0] - margin) <= cx <= (rn[2] + margin) and (rn[1] - margin) <= cy <= (rn[3] + margin):
+                cn = el.get("center_norm") or [(rn[0] + rn[2]) // 2, (rn[1] + rn[3]) // 2]
+                dist = (int(cn[0]) - cx) ** 2 + (int(cn[1]) - cy) ** 2
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best_el = el
+        return best_el
+
+    def evaluate_desktop_action_policy(
+        self,
+        instruction: str,
+        info: ChromeWindowInfo,
+        frame: Image.Image,
+        parsed: ParsedAction | None,
+        *,
+        resolved_ocr_el: dict[str, Any] | None = None,
+        gate_reason: str | None = None,
+    ) -> tuple[PolicyDecision, dict[str, Any] | None]:
+        """Evaluate policy on instruction + OCR element at the resolved coordinate (or title/page gate)."""
+        hit_el = resolved_ocr_el
+        if (
+            hit_el is None
+            and parsed is not None
+            and parsed.action in {"left_click", "double_click", "right_click", "type"}
+            and parsed.coordinate is not None
+        ):
+            ocr_reader = getattr(self, "_desktop_ocr", None)
+            if ocr_reader is not None:
+                try:
+                    perc = ocr_reader.recognize(frame, max_elements=60, max_chars=2400)
+                    hit_el = self._find_ocr_element_at_coord(list(perc.get("ocr_elements") or []), parsed.coordinate)
+                except Exception:
+                    hit_el = None
+        return evaluate_policy(instruction, element_meta=hit_el, gate_reason=gate_reason), hit_el
+
+    @staticmethod
+    def _token_base_sig(instruction: str, element_id: int | None, ocr_id: int | None = None) -> str:
+        return hashlib.sha256(f"{instruction}|{element_id}|{ocr_id}".encode("utf-8")).hexdigest()[:16]
+
+    def _make_confirm_token(
+        self,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+        target_sig: str = "",
+        matched_rule: str = "",
+    ) -> str:
+        sig = self._token_base_sig(instruction, element_id, ocr_id=ocr_id)
         token = secrets.token_hex(6)
-        self._pending_confirms[token] = (time.monotonic(), sig)
+        self._pending_confirms[token] = (time.monotonic(), sig, str(target_sig or ""), str(matched_rule or ""))
         return token
 
-    def _consume_confirm_token(self, token: str | None, instruction: str, element_id: int | None) -> bool:
+    def _peek_confirm_token(
+        self,
+        token: str | None,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+    ) -> tuple[str, str] | None:
         if not token or token not in self._pending_confirms:
-            return False
-        ts, sig = self._pending_confirms.pop(token)
+            return None
+        entry = self._pending_confirms[token]
+        if len(entry) >= 4:
+            ts, sig, target_sig, matched_rule = entry[0], entry[1], entry[2], entry[3]
+        else:
+            ts, sig = entry[0], entry[1]
+            target_sig, matched_rule = "", ""
         if time.monotonic() - ts > 600.0:
+            self._pending_confirms.pop(token, None)
+            return None
+        expected = self._token_base_sig(instruction, element_id, ocr_id=ocr_id)
+        if sig != expected:
+            return None
+        return str(target_sig), str(matched_rule)
+
+    def _consume_confirm_token(
+        self,
+        token: str | None,
+        instruction: str,
+        element_id: int | None,
+        *,
+        ocr_id: int | None = None,
+        required_target_sig: str = "",
+    ) -> bool:
+        peeked = self._peek_confirm_token(token, instruction, element_id, ocr_id=ocr_id)
+        if peeked is None:
             return False
-        expected = hashlib.sha256(f"{instruction}|{element_id}".encode("utf-8")).hexdigest()[:16]
-        return sig == expected
+        tok_target_sig, _tok_rule = peeked
+        if required_target_sig and tok_target_sig != required_target_sig:
+            return False
+        assert token is not None
+        self._pending_confirms.pop(token, None)
+        return True
+
+    def _verify_resolved_target_policy(
+        self,
+        *,
+        policy_inst: str,
+        element_id: int | None,
+        ocr_id: int | None,
+        confirm_token: str | None,
+        pre_confirmed: tuple[str, str] | None,
+        resolved_meta: dict[str, Any] | None,
+        coordinate: tuple[int, int] | list[int] | None,
+        mode_tag: str | None = None,
+        local_usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Verify resolved target element against policy; require target-bound confirmation if Red-tier."""
+        el_policy = evaluate_policy("", element_meta=resolved_meta)
+        if el_policy.tier == "red":
+            req_sig = self._confirm_target_sig(resolved_meta, el_policy.matched_rule)
+            matched = pre_confirmed is not None and (
+                pre_confirmed[0] == req_sig
+                or (pre_confirmed[0] == "" and pre_confirmed[1] == el_policy.matched_rule)
+            )
+            if matched:
+                if confirm_token:
+                    self._pending_confirms.pop(confirm_token, None)
+                return None
+            tok = self._make_confirm_token(
+                policy_inst,
+                element_id,
+                ocr_id=ocr_id,
+                target_sig=req_sig,
+                matched_rule=el_policy.matched_rule,
+            )
+            audit_rec: dict[str, Any] = {
+                "op": "act",
+                "blocked": "red_tier_post_grounding",
+                "rule": el_policy.matched_rule,
+                "instruction": policy_inst,
+            }
+            if mode_tag:
+                audit_rec["mode"] = mode_tag
+            append_audit(audit_rec)
+            self.task_state = "confirm"
+            self.task_step_label = el_policy.reason[:60]
+            self._emit_status("confirm", el_policy.reason, event_kind="task_alert", play_sound=True)
+            out: dict[str, Any] = {
+                "status": "needs_human_confirmation",
+                "confirm_token": tok,
+                "reason": el_policy.reason,
+                "matched_rule": el_policy.matched_rule,
+            }
+            if mode_tag:
+                out["mode"] = mode_tag
+            if coordinate is not None:
+                out["coordinate"] = list(coordinate)
+            if local_usage is not None:
+                out["local_usage"] = local_usage
+            return out
+        if pre_confirmed is not None and confirm_token:
+            self._pending_confirms.pop(confirm_token, None)
+        return None
 
     def get_status(self, light: bool = False) -> dict[str, Any]:
         """Full status; light=True (per-event UI telemetry) reuses the last GPU/window/tab probe instead of
@@ -3266,6 +3430,7 @@ class ChromeCUAEngine:
         text_hint: str | None = None,
         wait_settle: bool = False,
         include_text: bool = False,
+        _extra_policy_text: str = "",
     ) -> dict[str, Any]:
         mode_tag = getattr(self, "target_mode", "desktop")
         if element_id is not None and ocr_id is None and not text_hint and not instruction and action_json is None:
@@ -3278,7 +3443,8 @@ class ChromeCUAEngine:
         info, raw_img = self._capture_desktop_window(focus=False)
         self.active_title = info.title
         gate = self._check_desktop_title_gate(info.title)
-        inst_str = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+        base_inst = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+        inst_str = " ".join(x for x in (base_inst, _extra_policy_text) if x).strip()
         policy = evaluate_policy(inst_str, element_meta=None, gate_reason=gate)
         if policy.tier == "takeover":
             append_audit({"op": "act", "mode": mode_tag, "blocked": "takeover", "reason": policy.matched_rule, "title": info.title})
@@ -3293,8 +3459,9 @@ class ChromeCUAEngine:
                 "url": self.active_url,
                 "title": info.title,
             }
-        if policy.tier == "red" and not self._consume_confirm_token(confirm_token, inst_str, None):
-            tok = self._make_confirm_token(inst_str, None)
+        pre_confirmed = self._peek_confirm_token(confirm_token, inst_str, element_id, ocr_id=ocr_id)
+        if policy.tier == "red" and pre_confirmed is None:
+            tok = self._make_confirm_token(inst_str, element_id, ocr_id=ocr_id, matched_rule=policy.matched_rule)
             append_audit({"op": "act", "mode": mode_tag, "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_str})
             self.task_state = "confirm"
             self.task_step_label = policy.reason[:60]
@@ -3313,6 +3480,7 @@ class ChromeCUAEngine:
         grounding_source = "m35_vision"
         local_usage = _new_local_usage()
         parsed: Optional[ParsedAction] = None
+        resolved_ocr_el: dict[str, Any] | None = None
 
         if action_json is not None:
             grounding_source = "action_json"
@@ -3329,6 +3497,7 @@ class ChromeCUAEngine:
                     raw_text = json.dumps({"action": "left_click", "coordinate": [cx, cy], "ocr_id": ocr_id}, ensure_ascii=False)
                     parsed = ParsedAction(action="left_click", coordinate=(cx, cy), raw=raw_text)
                     grounding_source = "ocr_id"
+                    resolved_ocr_el = hit
                 elif not instruction:
                     return {
                         "status": "not_found",
@@ -3361,6 +3530,7 @@ class ChromeCUAEngine:
                     )
                     parsed = ParsedAction(action="left_click", coordinate=(cx, cy), raw=raw_text)
                     grounding_source = "ocr_hint"
+                    resolved_ocr_el = el_ocr
                 elif strategy == "ocr" or not instruction:
                     return {
                         "status": "not_found",
@@ -3406,6 +3576,24 @@ class ChromeCUAEngine:
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
+
+        _el_pol, hit_ocr = self.evaluate_desktop_action_policy(
+            base_inst, info, raw_img, parsed, resolved_ocr_el=resolved_ocr_el
+        )
+        blocked_post = self._verify_resolved_target_policy(
+            policy_inst=inst_str,
+            element_id=element_id,
+            ocr_id=ocr_id,
+            confirm_token=confirm_token,
+            pre_confirmed=pre_confirmed,
+            resolved_meta=hit_ocr,
+            coordinate=parsed.coordinate if parsed is not None else None,
+            mode_tag=mode_tag,
+            local_usage=local_usage,
+        )
+        if blocked_post is not None:
+            return blocked_post
+        token_consumed = True
 
         try:
             with self._desktop_io_guard():
@@ -3468,6 +3656,20 @@ class ChromeCUAEngine:
                                 "local_usage": local_usage,
                                 "elapsed_s": round(time.perf_counter() - t_start, 4),
                             }
+                        _re_pol, re_hit_ocr = self.evaluate_desktop_action_policy(base_inst, info, raw_img, parsed)
+                        blocked_re = self._verify_resolved_target_policy(
+                            policy_inst=inst_str,
+                            element_id=element_id,
+                            ocr_id=ocr_id,
+                            confirm_token=None,
+                            pre_confirmed=pre_confirmed,
+                            resolved_meta=re_hit_ocr,
+                            coordinate=parsed.coordinate,
+                            mode_tag=mode_tag,
+                            local_usage=local_usage,
+                        )
+                        if blocked_re is not None:
+                            return blocked_re
                 if self.abort_event.is_set():
                     self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
                     return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
@@ -3509,6 +3711,20 @@ class ChromeCUAEngine:
                     self._emit_status("idle", "已中止执行", event_kind="status", play_sound=False)
                     return {"status": "aborted", "mode": mode_tag, "reason": "aborted_by_user", "local_usage": local_usage}
                 if parsed_z is not None and parsed_z.action == "left_click" and parsed_z.coordinate is not None:
+                    _z_pol, z_hit_ocr = self.evaluate_desktop_action_policy(base_inst, after_info, after_img, parsed_z)
+                    blocked_z = self._verify_resolved_target_policy(
+                        policy_inst=inst_str,
+                        element_id=element_id,
+                        ocr_id=ocr_id,
+                        confirm_token=None,
+                        pre_confirmed=None,
+                        resolved_meta=z_hit_ocr,
+                        coordinate=parsed_z.coordinate,
+                        mode_tag=mode_tag,
+                        local_usage=local_usage,
+                    )
+                    if blocked_z is not None:
+                        return blocked_z
                     try:
                         with self._desktop_io_guard():
                             if self.abort_event.is_set():
@@ -3614,6 +3830,7 @@ class ChromeCUAEngine:
         wait_settle: bool = False,
         include_text: bool = False,
         scroll_retry: int = 0,
+        _extra_policy_text: str = "",
     ) -> dict[str, Any]:
         if self.abort_event.is_set():
             return {"status": "aborted", "reason": "aborted_by_user"}
@@ -3641,6 +3858,7 @@ class ChromeCUAEngine:
                     text_hint=text_hint,
                     wait_settle=wait_settle,
                     include_text=include_text,
+                    _extra_policy_text=_extra_policy_text,
                 )
 
             t_start = time.perf_counter()
@@ -3665,7 +3883,8 @@ class ChromeCUAEngine:
                 if dom_hit is not None:
                     target_el = dom_hit["element"]["el"]
 
-            inst_for_policy = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+            base_inst = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
+            inst_for_policy = " ".join(x for x in (base_inst, _extra_policy_text) if x).strip()
             policy = evaluate_policy(
                 inst_for_policy,
                 element_meta=target_el,
@@ -3682,11 +3901,41 @@ class ChromeCUAEngine:
                     "gate": policy.matched_rule,
                     "url": self.active_url,
                 }
-            token_ok = False
+            pre_confirmed = self._peek_confirm_token(confirm_token, inst_for_policy, element_id, ocr_id=ocr_id)
             if policy.tier == "red":
-                token_ok = self._consume_confirm_token(confirm_token, inst_for_policy, element_id)
-                if not token_ok:
-                    tok = self._make_confirm_token(inst_for_policy, element_id)
+                if target_el is not None:
+                    req_sig = self._confirm_target_sig(target_el, policy.matched_rule)
+                    matched = pre_confirmed is not None and (
+                        pre_confirmed[0] == req_sig
+                        or (pre_confirmed[0] == "" and pre_confirmed[1] == policy.matched_rule)
+                    )
+                    if matched and confirm_token:
+                        self._pending_confirms.pop(confirm_token, None)
+                    else:
+                        tok = self._make_confirm_token(
+                            inst_for_policy,
+                            element_id,
+                            ocr_id=ocr_id,
+                            target_sig=req_sig,
+                            matched_rule=policy.matched_rule,
+                        )
+                        append_audit({"op": "act", "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_for_policy})
+                        self.task_state = "confirm"
+                        self.task_step_label = policy.reason[:60]
+                        self._emit_status("confirm", policy.reason, event_kind="task_alert", play_sound=True)
+                        return {
+                            "status": "needs_human_confirmation",
+                            "confirm_token": tok,
+                            "reason": policy.reason,
+                            "matched_rule": policy.matched_rule,
+                        }
+                elif pre_confirmed is None:
+                    tok = self._make_confirm_token(
+                        inst_for_policy,
+                        element_id,
+                        ocr_id=ocr_id,
+                        matched_rule=policy.matched_rule,
+                    )
                     append_audit({"op": "act", "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_for_policy})
                     self.task_state = "confirm"
                     self.task_step_label = policy.reason[:60]
@@ -3706,6 +3955,8 @@ class ChromeCUAEngine:
             parsed: Optional[ParsedAction] = None
 
             if target_el is not None:
+                if pre_confirmed is not None and confirm_token:
+                    self._pending_confirms.pop(confirm_token, None)
                 if self.abort_event.is_set():
                     return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                 grounding_source = "dom_id" if element_id is not None else "dom_hint"
@@ -3728,6 +3979,29 @@ class ChromeCUAEngine:
                 grounding_source = "action_json"
                 raw_text = _normalize_action_json(action_json)
                 parsed = parse_and_validate_action(raw_text)
+                hit_el = None
+                if parsed.action in {"left_click", "double_click", "right_click", "type"} and parsed.coordinate is not None:
+                    cx, cy = parsed.coordinate
+                    hit_el = next(
+                        (
+                            e
+                            for e in snap.get("elements", [])
+                            if e["rect_norm"][0] <= cx <= e["rect_norm"][2] and e["rect_norm"][1] <= cy <= e["rect_norm"][3]
+                        ),
+                        None,
+                    )
+                blocked_aj = self._verify_resolved_target_policy(
+                    policy_inst=inst_for_policy,
+                    element_id=element_id,
+                    ocr_id=ocr_id,
+                    confirm_token=confirm_token,
+                    pre_confirmed=pre_confirmed,
+                    resolved_meta=hit_el,
+                    coordinate=parsed.coordinate,
+                    local_usage=local_usage,
+                )
+                if blocked_aj is not None:
+                    return blocked_aj
                 exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed, info, raw_img.size)
             else:
                 if not instruction:
@@ -3822,6 +4096,7 @@ class ChromeCUAEngine:
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
+                hit_el = None
                 if parsed.coordinate is not None:
                     cx, cy = parsed.coordinate
                     self._last_click_coord = (int(cx), int(cy))
@@ -3833,24 +4108,18 @@ class ChromeCUAEngine:
                         ),
                         None,
                     )
-                    if hit_el is not None:
-                        hit_policy = evaluate_policy(instruction, element_meta=hit_el)
-                        if hit_policy.tier == "red" and not token_ok:
-                            token_ok = self._consume_confirm_token(confirm_token, instruction, element_id)
-                        if hit_policy.tier == "red" and not token_ok:
-                            tok = self._make_confirm_token(instruction, element_id)
-                            append_audit({"op": "act", "blocked": "red_tier_post_grounding", "rule": hit_policy.matched_rule, "instruction": instruction})
-                            self.task_state = "confirm"
-                            self.task_step_label = hit_policy.reason[:60]
-                            self._emit_status("confirm", hit_policy.reason, event_kind="task_alert", play_sound=True)
-                            return {
-                                "status": "needs_human_confirmation",
-                                "confirm_token": tok,
-                                "reason": hit_policy.reason,
-                                "matched_rule": hit_policy.matched_rule,
-                                "coordinate": list(parsed.coordinate),
-                                "local_usage": local_usage,
-                            }
+                blocked_post = self._verify_resolved_target_policy(
+                    policy_inst=inst_for_policy,
+                    element_id=element_id,
+                    ocr_id=ocr_id,
+                    confirm_token=confirm_token,
+                    pre_confirmed=pre_confirmed,
+                    resolved_meta=hit_el,
+                    coordinate=parsed.coordinate,
+                    local_usage=local_usage,
+                )
+                if blocked_post is not None:
+                    return blocked_post
                 if self.abort_event.is_set():
                     return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                 exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed, info, raw_img.size)
@@ -3881,6 +4150,29 @@ class ChromeCUAEngine:
                         if self.abort_event.is_set():
                             return {"status": "aborted", "reason": "aborted_by_user", "local_usage": local_usage}
                         if parsed_z is not None and parsed_z.action == "left_click":
+                            hit_el_z = None
+                            if parsed_z.coordinate is not None:
+                                zx, zy = parsed_z.coordinate
+                                hit_el_z = next(
+                                    (
+                                        e
+                                        for e in after_snap.get("elements", []) or snap.get("elements", [])
+                                        if e["rect_norm"][0] <= zx <= e["rect_norm"][2] and e["rect_norm"][1] <= zy <= e["rect_norm"][3]
+                                    ),
+                                    None,
+                                )
+                            blocked_z = self._verify_resolved_target_policy(
+                                policy_inst=inst_for_policy,
+                                element_id=element_id,
+                                ocr_id=ocr_id,
+                                confirm_token=None,
+                                pre_confirmed=None,
+                                resolved_meta=hit_el_z,
+                                coordinate=parsed_z.coordinate,
+                                local_usage=local_usage,
+                            )
+                            if blocked_z is not None:
+                                return blocked_z
                             exec_ok, exec_status = self.chrome.dispatch_viewport_action(parsed_z, info, raw_img.size)
                             parsed = parsed_z
                             raw_text = raw_z
@@ -3961,15 +4253,6 @@ class ChromeCUAEngine:
 
         target_inst = spec.get("instruction") or spec.get("target")
         hint = spec.get("text_hint")
-        inst_pol = f"{target_inst or ''} {hint or ''} {text_val}".strip()
-
-        gate = self._check_desktop_title_gate(self.active_title) if self._is_desktop_like() else None
-        policy = evaluate_policy(inst_pol, element_meta=None, gate_reason=gate)
-        if policy.tier == "takeover":
-            return {"status": "needs_human_takeover", "reason": policy.reason, "gate": policy.matched_rule}
-        if policy.tier == "red" and not self._consume_confirm_token(spec.get("confirm_token"), inst_pol, spec.get("element_id")):
-            tok = self._make_confirm_token(inst_pol, spec.get("element_id"))
-            return {"status": "needs_human_confirmation", "confirm_token": tok, "reason": policy.reason, "matched_rule": policy.matched_rule}
 
         click_res = self.act(
             instruction=target_inst,
@@ -3981,6 +4264,7 @@ class ChromeCUAEngine:
             confirm_token=spec.get("confirm_token"),
             include_screenshot=False,
             wait_settle=False,
+            _extra_policy_text=text_val,
         )
         if click_res.get("status") != "ok":
             return click_res
@@ -4555,12 +4839,14 @@ class ChromeCUAEngine:
                 elif kind == "hotkey":
                     res = self.act(
                         action_json={"action": "hotkey", "keys": list(spec.get("keys") or [])},
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
                 elif kind == "type":
                     res = self.act(
                         action_json={"action": "type", "text": str(spec.get("text", ""))},
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
@@ -4572,6 +4858,7 @@ class ChromeCUAEngine:
                             "direction": str(spec.get("direction", "down")),
                             "amount": int(spec.get("amount", 5)),
                         },
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
@@ -4582,6 +4869,7 @@ class ChromeCUAEngine:
                             "coordinate": list(spec.get("coordinate") or [0, 0]),
                             "end_coordinate": list(spec.get("end_coordinate") or spec.get("to") or [0, 0]),
                         },
+                        confirm_token=spec.get("confirm_token"),
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
