@@ -453,7 +453,7 @@ def score_fixture_holdout(archive_path, predictions_path, data_receipt_path, scr
     capture_meta = json.loads((scratch / "capture.json").read_text(encoding="utf-8"))
     if capture_meta.get("purpose") != "HOLDOUT_DO_NOT_TRAIN":
         raise ValueError("Expected the independent fixture holdout bundle")
-    if set(capture_meta["groups"]) & set(data_receipt["train_groups_in_capture_manifests"]):
+    if set(capture_meta.get("groups", [])) & set(data_receipt.get("train_groups_in_capture_manifests", [])):
         raise ValueError("Holdout page families overlap with captured training families")
     train_dev_hashes = set(data_receipt["train_hashes"]) | set(data_receipt["validation_hashes"])
     truth = {}

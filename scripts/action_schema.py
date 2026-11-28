@@ -12,6 +12,7 @@ ALLOWED_ACTIONS = {
     "double_click",
     "right_click",
     "move",
+    "drag",
     "scroll",
     "type",
     "hotkey",
@@ -19,7 +20,7 @@ ALLOWED_ACTIONS = {
     "done",
     "not_found",
 }
-COORDINATE_ACTIONS = {"left_click", "double_click", "right_click", "move", "scroll"}
+COORDINATE_ACTIONS = {"left_click", "double_click", "right_click", "move", "drag", "scroll"}
 SCROLL_DIRECTIONS = {"up", "down", "left", "right"}
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -31,6 +32,7 @@ class ParsedAction:
 
     action: str
     coordinate: Optional[tuple[int, int]] = None
+    end_coordinate: Optional[tuple[int, int]] = None
     direction: Optional[str] = None
     amount: Optional[int] = None
     text: Optional[str] = None
@@ -84,6 +86,15 @@ def parse_and_validate_action(raw_text: str) -> ParsedAction:
     coord: Optional[tuple[int, int]] = None
     if action in COORDINATE_ACTIONS:
         coord = _parse_coordinate(data.get("coordinate"))
+
+    if action == "drag":
+        end_raw = data.get("end_coordinate")
+        if end_raw is None:
+            end_raw = data.get("to")
+        if end_raw is None:
+            end_raw = data.get("target_coordinate")
+        end_coord = _parse_coordinate(end_raw)
+        return ParsedAction(action=action, coordinate=coord, end_coordinate=end_coord, raw=data)
 
     if action == "scroll":
         direction = data.get("direction")

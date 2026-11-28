@@ -51,7 +51,39 @@ VK_MAP = {
     "down": 0x28,
     "left": 0x25,
     "right": 0x27,
+    "home": 0x24,
+    "end": 0x23,
+    "pageup": 0x21,
+    "pgup": 0x21,
+    "pagedown": 0x22,
+    "pgdn": 0x22,
+    "insert": 0x2D,
+    "ins": 0x2D,
+    "printscreen": 0x2C,
+    "prtsc": 0x2C,
+    "capslock": 0x14,
+    "numlock": 0x90,
+    "minus": 0xBD,
+    "equal": 0xBB,
+    "plus": 0xBB,
+    "comma": 0xBC,
+    "period": 0xBE,
+    "slash": 0xBF,
+    "semicolon": 0xBA,
+    "lbracket": 0xDB,
+    "rbracket": 0xDD,
+    "f1": 0x70,
+    "f2": 0x71,
+    "f3": 0x72,
+    "f4": 0x73,
     "f5": 0x74,
+    "f6": 0x75,
+    "f7": 0x76,
+    "f8": 0x77,
+    "f9": 0x78,
+    "f10": 0x79,
+    "f11": 0x7A,
+    "f12": 0x7B,
 }
 
 
@@ -128,6 +160,23 @@ def click_abs(screen_x: int, screen_y: int, button: str = "left", count: int = 1
             time.sleep(0.05)
 
 
+def drag_abs(sx1: int, sy1: int, sx2: int, sy2: int, steps: int = 12, duration_s: float = 0.22) -> None:
+    """Press left button at (sx1, sy1), glide smoothly to (sx2, sy2), and release."""
+    move_mouse_abs(sx1, sy1)
+    time.sleep(0.02)
+    _send_inputs([INPUT(type=INPUT_MOUSE, union=_INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)))])
+    n_steps = max(2, int(steps))
+    dt = max(0.005, float(duration_s) / n_steps)
+    for i in range(1, n_steps + 1):
+        t = i / n_steps
+        ix = round(sx1 + (sx2 - sx1) * t)
+        iy = round(sy1 + (sy2 - sy1) * t)
+        move_mouse_abs(ix, iy)
+        time.sleep(dt)
+    time.sleep(0.02)
+    _send_inputs([INPUT(type=INPUT_MOUSE, union=_INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)))])
+
+
 def scroll_abs(screen_x: int, screen_y: int, direction: str, amount: int) -> None:
     move_mouse_abs(screen_x, screen_y)
     time.sleep(0.015)
@@ -182,7 +231,7 @@ def check_corner_failsafe() -> bool:
 
 
 def execute_action(action: ParsedAction, hwnd: int, expected_roi: Rect, dry_run: bool = False) -> tuple[bool, str]:
-    """Verify Chrome window lock and execute one validated Phase 1 action."""
+    """Verify target window lock (or full-screen ROI when hwnd==0) and execute one validated action."""
     if check_corner_failsafe():
         return False, "failsafe_corner_triggered"
     if action.action in ("done", "not_found"):
@@ -192,7 +241,7 @@ def execute_action(action: ParsedAction, hwnd: int, expected_roi: Rect, dry_run:
             time.sleep(action.seconds or 1.0)
         return True, "waited"
 
-    if not is_window_ready(hwnd, expected_roi):
+    if hwnd > 0 and not is_window_ready(hwnd, expected_roi):
         return False, "window_lock_invalidated"
 
     if action.coordinate is not None:
@@ -200,10 +249,21 @@ def execute_action(action: ParsedAction, hwnd: int, expected_roi: Rect, dry_run:
     else:
         sx, sy = (0, 0)
 
+    if action.action == "drag":
+        if action.end_coordinate is None:
+            return False, "missing_end_coordinate"
+        sx2, sy2 = norm_to_screen(action.end_coordinate[0], action.end_coordinate[1], expected_roi)
+        if dry_run:
+            return True, f"dry_run:drag@({sx},{sy})->({sx2},{sy2})"
+        if hwnd > 0 and not is_point_on_window(hwnd, (sx, sy)):
+            return False, "target_covered"
+        drag_abs(sx, sy, sx2, sy2)
+        return True, "executed:drag"
+
     if dry_run:
         return True, f"dry_run:{action.action}@({sx},{sy})"
 
-    if action.coordinate is not None and not is_point_on_window(hwnd, (sx, sy)):
+    if hwnd > 0 and action.coordinate is not None and not is_point_on_window(hwnd, (sx, sy)):
         return False, "target_covered"
 
     if action.action == "left_click":

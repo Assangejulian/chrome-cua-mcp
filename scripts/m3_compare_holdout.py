@@ -24,6 +24,7 @@ MODEL_FILES = {
     "m2": ("m2_gguf", "m2-qwen35-2b-Q4_K_M.gguf", "m2-mmproj-f16.gguf"),
     "m3": ("m3_gguf", "m3-qwen35-2b-Q4_K_M.gguf", "m3-mmproj-f16.gguf"),
     "m35": ("m35_gguf", "m35-qwen35-2b-Q4_K_M.gguf", "m35-mmproj-f16.gguf"),
+    "m4": ("m4_gguf", "m4-qwen35-2b-Q4_K_M.gguf", "m4-mmproj-f16.gguf"),
 }
 
 

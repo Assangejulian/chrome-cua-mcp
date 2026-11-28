@@ -355,7 +355,8 @@ def test_stdio_mcp(test_url: str) -> None:
             ], names
 
             st, _ = call_tool("cua_status")
-            assert "M3.5" in st["model"], st
+            expected_model = cua_engine.available_model_options()[0].split(" · ")[0] if cua_engine.available_model_options() else "M3.5"
+            assert expected_model in st["model"], st
             assert st["active_harness"] == "Antigravity" and st["harness_mode"] == "single", st
 
             t_start, _ = call_tool("cua_task", {"event": "start", "title": "测试订单任务", "total_steps": 3, "play_sound": False})
@@ -1907,8 +1908,173 @@ def test_v14_efficiency_contracts(test_url: str) -> None:
             eng.close()
 
 
+def test_os_computer_use_contracts() -> None:
+    print("[7/7] Running Universal Windows OS Computer Use contracts...")
+    import action_executor
+    import action_schema
+    import roi_utils
+
+    # 1) action_schema: drag with end_coordinate & 'to' alias, plus bounds check
+    d1 = action_schema.parse_and_validate_action('{"action":"drag","coordinate":[100,200],"end_coordinate":[400,500]}')
+    assert d1.action == "drag" and d1.coordinate == (100, 200) and d1.end_coordinate == (400, 500), d1
+    d2 = action_schema.parse_and_validate_action('{"action":"drag","coordinate":[10,20],"to":[30,40]}')
+    assert d2.end_coordinate == (30, 40), d2
+    try:
+        action_schema.parse_and_validate_action('{"action":"drag","coordinate":[10,20],"end_coordinate":[1200,40]}')
+        raise AssertionError("Out-of-bounds drag end_coordinate should fail")
+    except action_schema.ActionValidationError:
+        pass
+
+    # 2) action_executor: extended keys & dry_run drag (both full-screen hwnd=0 and hwnd>0)
+    for key_tok in ("f1", "f12", "home", "end", "pageup", "pagedown"):
+        assert action_executor._resolve_vk(key_tok) > 0
+    roi = roi_utils.Rect(0, 0, 1920, 1080)
+    with patch.object(action_executor, "check_corner_failsafe", return_value=False):
+        ok0, msg0 = action_executor.execute_action(d1, hwnd=0, expected_roi=roi, dry_run=True)
+        assert ok0 and msg0.startswith("dry_run:drag@"), (ok0, msg0)
+        with patch.object(action_executor, "is_window_ready", return_value=True):
+            ok1, msg1 = action_executor.execute_action(d1, hwnd=99999, expected_roi=roi, dry_run=True)
+            assert ok1 and msg1.startswith("dry_run:drag@"), (ok1, msg1)
+
+    # 3) roi_utils: primary screen & safe window enumeration
+    scr = roi_utils.inspect_primary_screen()
+    assert scr.hwnd == 0 and scr.dwm_rect.width > 0 and scr.dwm_rect.height > 0, scr
+    all_wins = roi_utils.find_all_windows()
+    assert isinstance(all_wins, list)
+
+    # 4) ChromeCUAEngine + MCPServerCore in 'os' mode (mocked capture/OCR/VLM/executor)
+    os_img = Image.new("RGB", (1280, 800), (240, 244, 248))
+    os_eng = ChromeCUAEngine.__new__(ChromeCUAEngine)
+    os_eng.target_mode = "managed"
+    os_eng.desktop_hwnd = 0
+    os_eng.panel_hwnd = 0
+    os_eng.active_url = ""
+    os_eng.active_title = ""
+    os_eng.step_count = 0
+    os_eng.task_id = ""
+    os_eng.task_title = ""
+    os_eng.task_state = "idle"
+    os_eng.task_explicit = False
+    os_eng.task_step = 0
+    os_eng.task_total_steps = 0
+    os_eng.task_started_at = 0.0
+    os_eng.task_last_activity = 0.0
+    os_eng.task_step_label = ""
+    os_eng.recent_steps = []
+    os_eng.state = "idle"
+    os_eng.last_message = ""
+    os_eng.status_listener = None
+    os_eng.desktop_hide_hook = None
+    os_eng._pending_confirms = {}
+    os_eng._mcp_sessions = {}
+    os_eng.active_harness = ""
+    os_eng.mcp_clients = 0
+    os_eng.mcp_port = 0
+    os_eng._last_ocr_elements = []
+    os_eng._last_click_coord = None
+    os_eng._last_click_effect = None
+    os_eng._lock = threading.RLock()
+    os_eng.abort_event = threading.Event()
+    os_eng._desktop_io_guard = lambda: __import__("contextlib").nullcontext()
+    os_eng.prewarm_async = lambda: False
+    os_eng.chrome = SimpleNamespace(hwnd=0, is_running=lambda: False)
+    os_eng.grounder = SimpleNamespace(
+        model_label="M4 · Q4_K_M",
+        is_running=lambda: True,
+        port=18086,
+        ask_screen=lambda img, q, ocr_context="", crop_center=None: ("窗口显示桌面应用就绪", 0.12, {"prompt_tokens": 50, "completion_tokens": 8, "total_tokens": 58}),
+    )
+    os_eng._vram_cache = (time.monotonic(), {"total_mib": 8188, "used_mib": 1000, "free_mib": 7188})
+    os_eng._status_heavy = {"wins": [], "tabs_count": 0}
+    os_eng._desktop_url_reader = SimpleNamespace(read_url_and_tabs=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Chrome UIA called in os mode")))
+    os_eng._desktop_ocr = SimpleNamespace(recognize=lambda *a, **kw: {"page_text": "QQ 联系人 测试好友", "ocr_elements": [{"id": 1, "text": "测试好友", "center_norm": [220, 340], "rect_norm": [200, 330, 240, 350]}], "ocr_ms": 2.0})
+    fake_win = SimpleNamespace(
+        hwnd=777777, title="QQ", is_foreground=True, is_minimized=False,
+        dwm_rect=roi_utils.Rect(0, 0, 1280, 800), dpi_scale=1.0,
+    )
+    os_eng._list_desktop_windows = lambda: []
+    os_eng._list_os_windows = lambda: [(fake_win, "qq.exe")]
+
+    core = MCPServerCore(os_eng)
+    tools_resp = core.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}, "os_test")
+    tools = tools_resp["result"]["tools"]
+    assert len(tools) == 10
+    nav_tool = next(t for t in tools if t["name"] == "cua_navigate")
+    assert "os" in nav_tool["inputSchema"]["properties"]["mode"]["enum"]
+    assert "focus_window" in nav_tool["inputSchema"]["properties"]["action"]["enum"]
+    assert "all_apps" in nav_tool["inputSchema"]["properties"]
+
+    def call_os(name: str, args: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+        resp = core.handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": args or {}}}, "os_test")
+        assert "result" in resp, resp
+        res = resp["result"]
+        return json.loads(res["content"][0]["text"]), bool(res.get("isError"))
+
+    lw, lw_err = call_os("cua_navigate", {"action": "list_windows", "all_apps": True})
+    assert not lw_err and "desktop_windows" in lw and len(lw["os_windows"]) == 1 and lw["os_windows"][0]["process"] == "qq.exe", lw
+
+    sm, sm_err = call_os("cua_navigate", {"action": "set_mode", "mode": "os", "hwnd": 0})
+    assert not sm_err and sm["target_mode"] == "os" and sm["desktop_hwnd"] == 0, sm
+
+    with patch.object(cua_engine, "capture_roi", return_value=os_img), \
+            patch.object(cua_engine, "inspect_primary_screen", return_value=scr):
+        obs_os, obs_err = call_os("cua_observe", {"detail": "brief"})
+        assert not obs_err and obs_os["mode"] == "os" and obs_os["hwnd"] == 0 and "QQ" in obs_os["page_text"], obs_os
+
+        ask_os, ask_err = call_os("cua_ask_screen", {"question": "画面上有什么？"})
+        assert not ask_err and ask_os["mode"] == "os" and "桌面应用" in ask_os["answer"], ask_os
+
+        red_os, red_err = call_os("cua_act", {"instruction": "点击支付按钮"})
+        assert not red_err and red_os["status"] == "needs_human_confirmation" and red_os["mode"] == "os", red_os
+
+        with patch.object(cua_engine, "check_corner_failsafe", return_value=False), \
+                patch.object(cua_engine, "execute_action", return_value=(True, "executed:drag")) as mock_exec:
+            drag_os, drag_err = call_os("cua_act", {"action_json": {"action": "drag", "coordinate": [100, 100], "end_coordinate": [400, 300]}})
+            assert not drag_err and drag_os["status"] == "ok" and drag_os["mode"] == "os" and drag_os["action"] == "drag", drag_os
+            assert mock_exec.call_count == 1 and mock_exec.call_args.args[0].end_coordinate == (400, 300)
+
+    goto_os, goto_err = call_os("cua_navigate", {"action": "goto", "url": "https://example.com"})
+    assert goto_err and "mode='os'" in goto_os["error"], goto_os
+
+    # 5) Task auto-completion fallback & explicit cua_task lifecycle contracts
+    from chrome_cua_mcp import MCP_INSTRUCTIONS
+    assert "cua_task" in MCP_INSTRUCTIONS
+
+    emitted: list[dict[str, Any]] = []
+    os_eng.status_listener = lambda st: emitted.append(dict(st))
+    os_eng._begin_auto_step("读取桌面")
+    assert os_eng.task_state == "running" and os_eng.task_explicit is False
+    orig_activity = os_eng.task_last_activity
+    os_eng.task_started_at = orig_activity - 3.5
+    auto_done = os_eng.complete_auto_task(message="任务已完成", play_sound=True)
+    assert auto_done["status"] == "ok" and auto_done["task_state"] == "done", auto_done
+    assert os_eng.task_last_activity == orig_activity
+    assert abs(auto_done["task_elapsed_s"] - 3.5) < 0.05, auto_done
+    assert emitted and emitted[-1]["event_kind"] == "task_done" and emitted[-1]["play_sound"] is True
+
+    st_start = os_eng.update_task("start", title="显式任务", total_steps=2, play_sound=False)
+    assert st_start["task_state"] == "running" and os_eng.task_explicit is True
+    assert os_eng.complete_auto_task()["status"] == "noop"
+    st_done = os_eng.update_task("done", message="完成", play_sound=False)
+    assert st_done["task_state"] == "done" and os_eng.task_explicit is False
+
+    # 6) SoundCuePlayer synthesized completion chime WAV contract
+    import io
+    import wave
+    from chrome_pilot_panel import SoundCuePlayer
+
+    player = SoundCuePlayer()
+    with wave.open(io.BytesIO(player._clips["done"]), "rb") as wv:
+        assert wv.getnchannels() == 1 and wv.getframerate() == 44100
+        assert (wv.getnframes() / float(wv.getframerate())) >= 0.35
+    player.play("done", enabled=False)
+
+    print("  [PASS] Universal Windows OS Computer Use (mode='os', drag, extended hotkeys, all_apps, Red-tier guard) verified.")
+
+
 def main() -> int:
     test_perceiver_and_guards()
+    test_os_computer_use_contracts()
     srv, url = start_fixture_http()
     try:
         test_p1_contracts(url)

@@ -21,6 +21,7 @@ profiles/
 
 # Working notes between sessions (local only)
 docs/handoff/
+docs/blog_*.md
 
 # Archives
 *.zip

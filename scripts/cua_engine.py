@@ -73,13 +73,18 @@ from roi_utils import (
     ChromeWindowInfo,
     Rect,
     capture_chrome_window,
+    capture_roi,
     enable_per_monitor_dpi_awareness,
+    find_all_windows,
     find_chrome_windows,
+    get_window_process_name,
     inspect_chrome_window,
+    inspect_primary_screen,
     norm_to_screen,
 )
 
 MODEL_PRESETS = {
+    "M4": ("m4_gguf", "m4-qwen35-2b-", "m4-mmproj-f16.gguf"),
     "M3.5": ("m35_gguf", "m35-qwen35-2b-", "m35-mmproj-f16.gguf"),
     "M3": ("m3_gguf", "m3-qwen35-2b-", "m3-mmproj-f16.gguf"),
     "M2": ("m2_gguf", "m2-qwen35-2b-", "m2-mmproj-f16.gguf"),
@@ -405,6 +410,26 @@ def _brief_observation(obs: dict[str, Any]) -> dict[str, Any]:
         out.pop("popup_close_ids", None)
     if "auth_or_captcha_gate" in out and out["auth_or_captcha_gate"] is None:
         del out["auth_or_captcha_gate"]
+    # Token slimming: brief payloads are for the upper model's next decision, not full reading.
+    for key, cap in (("text_excerpt", 1200), ("page_text", 1200)):
+        val = out.get(key)
+        if isinstance(val, str) and len(val) > cap:
+            out[key] = val[:cap]
+    els = out.get("elements")
+    if isinstance(els, list):
+        slimmed = []
+        for el in els[:40]:
+            if isinstance(el, dict):
+                el = dict(el)
+                for key in ("text", "aria", "placeholder", "href"):
+                    val = el.get(key)
+                    if isinstance(val, str) and len(val) > 48:
+                        el[key] = val[:48]
+            slimmed.append(el)
+        out["elements"] = slimmed
+    ocr = out.get("ocr_elements")
+    if isinstance(ocr, list) and len(ocr) > 80:
+        out["ocr_elements"] = ocr[:80]
     return out
 
 
@@ -1208,12 +1233,72 @@ class ManagedChromeSession:
             return True, "cdp_executed:type"
 
         if parsed.action == "scroll":
-            delta = (parsed.amount or 3) * 120
+            ticks = max(1, int(parsed.amount or 3))
             direction = parsed.direction or "down"
-            dx = float(delta) if direction == "right" else (-float(delta) if direction == "left" else 0.0)
-            dy = float(delta) if direction == "down" else (-float(delta) if direction == "up" else 0.0)
-            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": css_x, "y": css_y, "deltaX": dx, "deltaY": dy})
-            return True, "cdp_executed:scroll"
+            step_x = 120.0 if direction == "right" else (-120.0 if direction == "left" else 0.0)
+            step_y = 120.0 if direction == "down" else (-120.0 if direction == "up" else 0.0)
+
+            def _scroll_state() -> tuple[float, bool]:
+                try:
+                    r = self.cdp.send("Runtime.evaluate", {
+                        "expression": "JSON.stringify({y:window.scrollY||document.documentElement.scrollTop||0,max:Math.max(0,(document.documentElement.scrollHeight||0)-window.innerHeight),x:window.scrollX||0})",
+                        "returnByValue": True})
+                    val = (r.get("result") or {}).get("result") or {}
+                    raw = val.get("value")
+                    if raw:
+                        import json as _json
+                        st = _json.loads(raw)
+                        return float(st.get("y", 0.0)), bool(st.get("max", 0) > 4)
+                except Exception:
+                    pass
+                return 0.0, True
+
+            before_y, scrollable = _scroll_state()
+            # real-input path: hover first, then per-notch wheel ticks like a physical wheel
+            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": css_x, "y": css_y, "button": "none"})
+            time.sleep(0.02)
+            for _ in range(ticks):
+                self.cdp.send("Input.dispatchMouseEvent", {
+                    "type": "mouseWheel", "x": css_x, "y": css_y,
+                    "deltaX": step_x, "deltaY": step_y, "buttons": 0,
+                })
+                time.sleep(0.03)
+            time.sleep(0.12)
+            after_y, _ = _scroll_state()
+            total_dy = step_y * ticks
+            if abs(after_y - before_y) > 2 or not scrollable or step_y == 0:
+                return True, "cdp_executed:scroll"
+            # fallback 1: wheel at viewport centre (target element may swallow wheel events)
+            try:
+                vp = self.cdp.send("Runtime.evaluate", {
+                    "expression": "JSON.stringify({w:window.innerWidth,h:window.innerHeight})", "returnByValue": True})
+                raw = ((vp.get("result") or {}).get("result") or {}).get("value")
+                if raw:
+                    import json as _json
+                    dims = _json.loads(raw)
+                    cx2, cy2 = float(dims["w"]) / 2.0, float(dims["h"]) / 2.0
+                    self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": cx2, "y": cy2, "button": "none"})
+                    time.sleep(0.02)
+                    for _ in range(ticks):
+                        self.cdp.send("Input.dispatchMouseEvent", {
+                            "type": "mouseWheel", "x": cx2, "y": cy2,
+                            "deltaX": step_x, "deltaY": step_y, "buttons": 0,
+                        })
+                        time.sleep(0.03)
+                    time.sleep(0.12)
+                    after_y, _ = _scroll_state()
+                    if abs(after_y - before_y) > 2:
+                        return True, "cdp_executed:scroll_center_retry"
+            except Exception:
+                pass
+            # fallback 2: direct DOM scroll so the action is never a silent no-op
+            try:
+                self.cdp.send("Runtime.evaluate", {
+                    "expression": f"window.scrollBy({step_x * ticks:.0f},{total_dy:.0f});'ok'",
+                    "returnByValue": True})
+                return True, "cdp_executed:scroll_js_fallback"
+            except Exception:
+                return True, "cdp_executed:scroll_no_effect"
 
         return False, f"unsupported_action:{parsed.action}"
 
@@ -1362,7 +1447,7 @@ class ChromeCUAEngine:
         desktop_hwnd: int = 0,
         desktop_hide_hook: Optional[Callable[[bool], None]] = None,
     ) -> None:
-        if target_mode not in {"managed", "desktop"}:
+        if target_mode not in {"managed", "desktop", "os"}:
             raise ValueError(f"Unsupported target_mode: {target_mode!r}")
         enable_per_monitor_dpi_awareness()
         self.chrome = ManagedChromeSession(profile_dir=profile_dir)
@@ -1371,6 +1456,7 @@ class ChromeCUAEngine:
         self.status_listener = status_listener
         self.target_mode = target_mode
         self.desktop_hwnd = int(desktop_hwnd or 0)
+        self.panel_hwnd: int = 0
         self.desktop_hide_hook = desktop_hide_hook
         self._desktop_uia: Optional[UIAHelper] = None
         self._desktop_ocr = PersistentWinRTOCR()
@@ -1386,6 +1472,7 @@ class ChromeCUAEngine:
         self.task_id: str = ""
         self.task_title: str = ""
         self.task_state: str = "idle"  # "idle" | "running" | "done" | "confirm" | "error"
+        self.task_explicit: bool = False
         self.task_step: int = 0
         self.task_total_steps: int = 0
         self.task_started_at: float = 0.0
@@ -1514,6 +1601,7 @@ class ChromeCUAEngine:
             self.task_id = secrets.token_hex(4)
             self.task_title = ""
             self.task_state = "running"
+            self.task_explicit = False
             self.task_step = 0
             self.task_total_steps = 0
             self.task_started_at = now
@@ -1542,6 +1630,7 @@ class ChromeCUAEngine:
                 self.task_id = secrets.token_hex(4)
                 self.task_title = (title or "执行任务").strip()
                 self.task_state = "running"
+                self.task_explicit = True
                 self.task_step = int(step) if step is not None else 0
                 self.task_total_steps = int(total_steps) if total_steps is not None else 0
                 self.task_started_at = now
@@ -1578,6 +1667,7 @@ class ChromeCUAEngine:
                 if total_steps is not None:
                     self.task_total_steps = int(total_steps)
                 self.task_state = "done"
+                self.task_explicit = False
                 self.task_last_activity = now
                 self.task_step_label = (message or f"{self.task_title or '任务'}已完成").strip()[:60]
                 self._emit_status("idle", self.task_step_label, event_kind="task_done", play_sound=bool(play_sound))
@@ -1585,6 +1675,7 @@ class ChromeCUAEngine:
                 if title:
                     self.task_title = title.strip()
                 self.task_state = "error"
+                self.task_explicit = False
                 self.task_last_activity = now
                 self.task_step_label = (message or "任务异常终止").strip()[:60]
                 self._emit_status("error", self.task_step_label, event_kind="task_error", play_sound=bool(play_sound))
@@ -1599,9 +1690,34 @@ class ChromeCUAEngine:
                 "task_elapsed_s": round(max(0.0, end_t - self.task_started_at), 2) if self.task_started_at > 0.0 else 0.0,
             }
 
+    def complete_auto_task(self, message: str | None = None, play_sound: bool = True) -> dict[str, Any]:
+        """Auto-close an implicit (non-cua_task) running sequence after idle grace without stretching elapsed time."""
+        with self._lock:
+            if self.task_state != "running" or getattr(self, "task_explicit", False):
+                return {"status": "noop", "task_state": self.task_state}
+            self.task_state = "done"
+            self.task_explicit = False
+            self.task_step_label = (message or "任务已完成").strip()[:60]
+            self._emit_status("idle", self.task_step_label, event_kind="task_done", play_sound=bool(play_sound))
+            elapsed = round(max(0.0, self.task_last_activity - self.task_started_at), 2) if self.task_started_at > 0.0 else 0.0
+            return {
+                "status": "ok",
+                "task_state": self.task_state,
+                "task_step": self.task_step,
+                "task_step_label": self.task_step_label,
+                "task_elapsed_s": elapsed,
+            }
+
+    def _is_desktop_like(self) -> bool:
+        return getattr(self, "target_mode", "managed") in {"desktop", "os"}
+
     def _list_desktop_windows(self) -> list[ChromeWindowInfo]:
         managed_hwnd = self.chrome.hwnd
         return [w for w in find_chrome_windows() if not managed_hwnd or w.hwnd != managed_hwnd]
+
+    def _list_os_windows(self) -> list[tuple[ChromeWindowInfo, str]]:
+        excluded = {h for h in (self.chrome.hwnd, getattr(self, "panel_hwnd", 0)) if h}
+        return find_all_windows(exclude_hwnds=excluded)
 
     @staticmethod
     def _serialize_windows(wins: list[ChromeWindowInfo]) -> list[dict[str, Any]]:
@@ -1616,6 +1732,20 @@ class ChromeCUAEngine:
         ]
 
     @staticmethod
+    def _serialize_os_windows(wins: list[tuple[ChromeWindowInfo, str]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "hwnd": w.hwnd,
+                "title": w.title,
+                "process": proc,
+                "is_foreground": w.is_foreground,
+                "is_minimized": w.is_minimized,
+                "rect": list(w.dwm_rect.to_tuple()),
+            }
+            for w, proc in wins
+        ]
+
+    @staticmethod
     def _check_desktop_title_gate(title: str, page_text: str = "") -> str | None:
         low = f"{title or ''}\n{(page_text or '')[:1000]}".lower()
         for sig in ("just a moment", "请完成安全验证", "人机验证", "verify you are human", "checking your browser"):
@@ -1624,10 +1754,35 @@ class ChromeCUAEngine:
         return None
 
     def set_target_mode(self, mode: str, hwnd: int | None = None) -> dict[str, Any]:
-        """Switch CUA engine target between 'managed' background Chrome and 'desktop' Chrome."""
-        if mode not in {"managed", "desktop"}:
+        """Switch CUA engine target between 'managed' Chrome, 'desktop' Chrome, and 'os' (any window or full screen)."""
+        if mode not in {"managed", "desktop", "os"}:
             raise ValueError(f"Unsupported target_mode: {mode!r}")
         with self._lock:
+            if mode == "os":
+                os_wins = self._list_os_windows()
+                target_hwnd = int(hwnd) if hwnd is not None else 0
+                if target_hwnd > 0:
+                    if not win32gui.IsWindow(target_hwnd):
+                        raise ValueError(f"OS window hwnd not found: {target_hwnd}")
+                    info = inspect_chrome_window(target_hwnd)
+                    proc = get_window_process_name(target_hwnd)
+                    self.desktop_hwnd = target_hwnd
+                    desktop_title = info.title
+                else:
+                    self.desktop_hwnd = 0
+                    desktop_title = "Primary Screen"
+                    proc = "desktop"
+                self.target_mode = "os"
+                self.active_title = desktop_title
+                self._emit_status("idle", f"已切换到：全桌面 Computer Use（{desktop_title[:24]}）")
+                return {
+                    "target_mode": self.target_mode,
+                    "desktop_hwnd": self.desktop_hwnd,
+                    "desktop_title": desktop_title,
+                    "desktop_process": proc,
+                    "os_windows": self._serialize_os_windows(os_wins),
+                }
+
             wins = self._list_desktop_windows()
             if hwnd is not None and int(hwnd) > 0:
                 target_hwnd = int(hwnd)
@@ -1653,10 +1808,19 @@ class ChromeCUAEngine:
             }
 
     def _resolve_desktop_window(self, focus: bool = False) -> ChromeWindowInfo:
+        if getattr(self, "target_mode", "desktop") == "os":
+            if self.desktop_hwnd > 0 and win32gui.IsWindow(self.desktop_hwnd):
+                chosen = inspect_chrome_window(self.desktop_hwnd)
+                if focus or chosen.is_minimized:
+                    chosen = focus_chrome_window(chosen, settle_s=0.18)
+                return chosen
+            self.desktop_hwnd = 0
+            return inspect_primary_screen()
+
         wins = self._list_desktop_windows()
         if not wins:
             self.desktop_hwnd = 0
-            raise RuntimeError("未检测到本机已打开的桌面 Chrome 窗口；请先打开本机 Chrome，或切换到 managed 托管模式。")
+            raise RuntimeError("未检测到本机已打开的桌面 Chrome 窗口；请先打开本机 Chrome，或切换到 managed / os 模式。")
         chosen = next((w for w in wins if w.hwnd == self.desktop_hwnd), None)
         if chosen is None:
             chosen = next((w for w in wins if not w.is_minimized), wins[0])
@@ -1667,17 +1831,28 @@ class ChromeCUAEngine:
 
     def _capture_desktop_window(self, focus: bool = False) -> tuple[ChromeWindowInfo, Image.Image]:
         info = self._resolve_desktop_window(focus=focus)
+        if info.hwnd == 0:
+            return info, capture_roi(info.dwm_rect)
         try:
             img = print_window_dwm(info)
+            if getattr(self, "target_mode", "desktop") == "os" and int(np.asarray(img).max()) == 0:
+                raise RuntimeError("print_window_blank")
         except Exception:
             info = focus_chrome_window(info, settle_s=0.18)
-            img = capture_chrome_window(info)
+            if getattr(self, "target_mode", "desktop") == "os":
+                img = capture_roi(info.dwm_rect)
+            else:
+                img = capture_chrome_window(info)
         return info, img
 
     def _focus_and_verify_desktop(self, info: ChromeWindowInfo, settle_s: float = 0.16) -> ChromeWindowInfo:
-        """Bring desktop Chrome to foreground and fail closed before any SendInput if focus did not switch."""
+        """Bring target window to foreground and fail closed before any SendInput if focus did not switch."""
+        if getattr(self, "target_mode", "desktop") == "os" and info.hwnd == 0:
+            return info
         focused = focus_chrome_window(info, settle_s=settle_s)
         if win32gui.GetForegroundWindow() != focused.hwnd:
+            if getattr(self, "target_mode", "desktop") == "os":
+                raise RuntimeError("target_window_not_foreground: 未能将目标窗口切至前台，已中止按键发送以防误输入到其他软件")
             raise RuntimeError("chrome_not_foreground: 未能将本机 Chrome 切至前台，已中止按键发送以防误输入到其他软件")
         return focused
 
@@ -1727,6 +1902,23 @@ class ChromeCUAEngine:
         max_elements: int = 60,
         max_chars: int = 2400,
     ) -> dict[str, Any]:
+        if getattr(self, "target_mode", "managed") == "os":
+            ocr_data = self._desktop_ocr.recognize(raw_img, max_elements=max_elements, max_chars=max_chars)
+            ocr_els = list(ocr_data.get("ocr_elements") or [])
+            self._last_ocr_elements = ocr_els
+            self.active_url = ""
+            if info.title:
+                self.active_title = info.title
+            proc = get_window_process_name(info.hwnd) if info.hwnd else "desktop"
+            return {
+                "url": "",
+                "title": info.title,
+                "process": proc,
+                "page_text": str(ocr_data.get("page_text", "")),
+                "ocr_elements": ocr_els,
+                "ocr_ms": float(ocr_data.get("ocr_ms", 0.0)),
+                "tabs": [],
+            }
         uia_max_y = info.dwm_rect.top + round(190 * info.dpi_scale)
         uia_data = self._desktop_url_reader.read_url_and_tabs(info.hwnd, max_y_px=uia_max_y)
         ocr_data = self._desktop_ocr.recognize(raw_img, max_elements=max_elements, max_chars=max_chars)
@@ -1798,6 +1990,12 @@ class ChromeCUAEngine:
         wins = self._status_heavy["wins"]
         tabs_count = self._status_heavy["tabs_count"]
         chosen = next((w for w in wins if w.hwnd == self.desktop_hwnd), wins[0] if wins else None)
+        if self.target_mode == "os":
+            reported_hwnd = self.desktop_hwnd if (self.desktop_hwnd == 0 or win32gui.IsWindow(self.desktop_hwnd)) else 0
+            reported_title = win32gui.GetWindowText(reported_hwnd) if reported_hwnd else "Primary Screen"
+        else:
+            reported_hwnd = self.desktop_hwnd or (chosen.hwnd if chosen else 0)
+            reported_title = chosen.title if chosen else ""
         if self.task_started_at > 0.0:
             end_t = time.monotonic() if self.task_state == "running" else self.task_last_activity
             task_elapsed = round(max(0.0, end_t - self.task_started_at), 2)
@@ -1812,8 +2010,8 @@ class ChromeCUAEngine:
             "state": self.state,
             "last_message": self.last_message,
             "target_mode": self.target_mode,
-            "desktop_hwnd": self.desktop_hwnd or (chosen.hwnd if chosen else 0),
-            "desktop_title": chosen.title if chosen else "",
+            "desktop_hwnd": reported_hwnd,
+            "desktop_title": reported_title,
             "desktop_windows": self._serialize_windows(wins),
             "model": self.grounder.model_label,
             "vlm_running": self.grounder.is_running(),
@@ -1829,6 +2027,7 @@ class ChromeCUAEngine:
             "connected_harnesses": connected_harnesses,
             "harness_mode": harness_mode,
             "task_state": self.task_state,
+            "task_explicit": bool(getattr(self, "task_explicit", False)),
             "task_title": self.task_title,
             "task_step": self.task_step,
             "task_total_steps": self.task_total_steps,
@@ -1848,9 +2047,9 @@ class ChromeCUAEngine:
     ) -> dict[str, Any]:
         brief = str(detail).lower() == "brief"
         with self._lock:
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 if self.task_state != "running":
-                    self._emit_status("running", "正在识别本机 Chrome 画面…")
+                    self._emit_status("running", "正在识别本机画面…")
                 info, raw_img = self._capture_desktop_window(focus=False)
                 w_dwm, h_dwm = raw_img.size
                 perc = self._perceive_desktop(info, raw_img, max_elements=max_elements, max_chars=2400)
@@ -1864,7 +2063,7 @@ class ChromeCUAEngine:
                 self._emit_status(next_state, msg)
                 out: dict[str, Any] = {
                     "status": "ok",
-                    "mode": "desktop_vision",
+                    "mode": "desktop_vision" if self.target_mode == "desktop" else "os",
                     "hwnd": info.hwnd,
                     "url": perc["url"],
                     "title": info.title,
@@ -1875,6 +2074,8 @@ class ChromeCUAEngine:
                     "popup_detected": False,
                     "auth_or_captcha_gate": gate,
                 }
+                if self.target_mode == "os":
+                    out["process"] = perc.get("process", "")
                 self._attach_screenshot(out, raw_img, include_screenshot, screenshot_format)
                 return _brief_observation(out) if brief else out
 
@@ -1926,11 +2127,21 @@ class ChromeCUAEngine:
         placeholder_prefixes = ("新标签页", "New Tab", "about:blank", "Untitled")
 
         def _snap_cur() -> tuple[ChromeWindowInfo, Image.Image]:
+            if hwnd == 0 and self.target_mode == "os":
+                ci = inspect_primary_screen()
+                return ci, capture_roi(ci.dwm_rect)
             ci = inspect_chrome_window(hwnd) if win32gui.IsWindow(hwnd) else self._resolve_desktop_window(focus=False)
+            if ci.hwnd == 0:
+                return ci, capture_roi(ci.dwm_rect)
             try:
                 im = print_window_dwm(ci)
+                if self.target_mode == "os" and int(np.asarray(im).max()) == 0:
+                    raise RuntimeError("print_window_blank")
             except Exception:
-                im = capture_chrome_window(ci)
+                if self.target_mode == "os":
+                    im = capture_roi(ci.dwm_rect)
+                else:
+                    im = capture_chrome_window(ci)
             return ci, im
 
         cur_info, cur_img = _snap_cur()
@@ -2064,7 +2275,53 @@ class ChromeCUAEngine:
         tab_id: str | int | None,
         include_screenshot: bool = False,
         screenshot_format: str = "jpeg",
+        hwnd: int | None = None,
     ) -> dict[str, Any]:
+        if action == "focus_window":
+            os_wins = self._list_os_windows()
+            matched_pair: tuple[ChromeWindowInfo, str] | None = None
+            target_id = hwnd if (hwnd is not None and int(hwnd) > 0) else (
+                int(tab_id) if (isinstance(tab_id, int) or (isinstance(tab_id, str) and tab_id.isdigit())) else None
+            )
+            if target_id is not None:
+                matched_pair = next((pair for pair in os_wins if pair[0].hwnd == target_id), None)
+                if matched_pair is None and win32gui.IsWindow(target_id):
+                    matched_pair = (inspect_chrome_window(target_id), get_window_process_name(target_id))
+            elif tab_id is not None or url:
+                ref_low = str(tab_id or url).strip().lower()
+                matched_pair = next(
+                    (pair for pair in os_wins if ref_low in pair[0].title.lower() or ref_low in pair[1].lower()),
+                    None,
+                )
+            if matched_pair is None:
+                raise ValueError(f"Desktop window not found: {hwnd or tab_id or url!r}")
+            matched_win, matched_proc = matched_pair
+            self.target_mode = "os"
+            self.desktop_hwnd = matched_win.hwnd
+            with self._desktop_io_guard():
+                focused = focus_chrome_window(matched_win, settle_s=0.18)
+            new_info, shot_img = self._capture_desktop_window(focus=False)
+            perc = self._perceive_desktop(new_info, shot_img, max_elements=60, max_chars=2400)
+            self.active_title = focused.title
+            out: dict[str, Any] = {
+                "mode": "os",
+                "hwnd": focused.hwnd,
+                "process": matched_proc,
+                "url": "",
+                "title": focused.title,
+                "page_text": perc["page_text"],
+                "ocr_elements": _compact_ocr_elements(perc["ocr_elements"]),
+                "ocr_ms": perc["ocr_ms"],
+            }
+            self._attach_screenshot(out, shot_img, include_screenshot, screenshot_format)
+            return out
+
+        if getattr(self, "target_mode", "desktop") == "os" and action in {"goto", "new_tab", "back", "forward", "reload", "list_tabs", "switch_tab", "close_tab"}:
+            raise ValueError(
+                f"Action {action!r} requires mode='desktop' or 'managed' (Chrome); "
+                "in mode='os' use list_windows, focus_window, set_mode, or cua_act."
+            )
+
         hotkey_map = {
             "back": ["alt", "left"],
             "forward": ["alt", "right"],
@@ -2308,22 +2565,39 @@ class ChromeCUAEngine:
         max_elements: int = 45,
         max_text_chars: int = 2500,
         detail: str = "full",
+        all_apps: bool = False,
     ) -> dict[str, Any]:
         brief = str(detail).lower() == "brief"
         with self._lock:
             if action == "list_windows":
                 wins = self._list_desktop_windows()
                 chosen = next((w for w in wins if w.hwnd == self.desktop_hwnd), wins[0] if wins else None)
-                return {
+                out_wins: dict[str, Any] = {
                     "status": "ok",
                     "target_mode": self.target_mode,
-                    "desktop_hwnd": self.desktop_hwnd or (chosen.hwnd if chosen else 0),
+                    "desktop_hwnd": self.desktop_hwnd if self.target_mode == "os" else (self.desktop_hwnd or (chosen.hwnd if chosen else 0)),
                     "desktop_windows": self._serialize_windows(wins),
                 }
+                if all_apps or self.target_mode == "os":
+                    out_wins["os_windows"] = self._serialize_os_windows(self._list_os_windows())
+                return out_wins
             if action == "set_mode":
                 resolved_mode = str(mode or tab_id or url or "managed").strip().lower()
                 res = self.set_target_mode(resolved_mode, hwnd=hwnd)
                 append_audit({"op": "navigate", "action": "set_mode", "mode": resolved_mode, "hwnd": hwnd})
+                return {"status": "ok", **res}
+            if action == "focus_window":
+                self._begin_auto_step(f"切换窗口: {str(hwnd or tab_id or url or '')[:32]}")
+                res = self._navigate_desktop(
+                    "focus_window",
+                    url,
+                    tab_id,
+                    include_screenshot=include_screenshot,
+                    screenshot_format=screenshot_format,
+                    hwnd=hwnd,
+                )
+                append_audit({"op": "navigate", "mode": "os", "action": "focus_window", "hwnd": res.get("hwnd"), "title": res.get("title")})
+                self._emit_status("running" if self.task_state == "running" else "idle", f"已切换窗口 · {res.get('title', '')[:28]}")
                 return {"status": "ok", **res}
 
             if action in {"goto", "new_tab", "back", "forward", "reload", "switch_tab", "close_tab"}:
@@ -2332,15 +2606,16 @@ class ChromeCUAEngine:
             else:
                 self._emit_status("running", f"导航中: {action}")
 
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 res = self._navigate_desktop(
                     action,
                     url,
                     tab_id,
                     include_screenshot=include_screenshot,
                     screenshot_format=screenshot_format,
+                    hwnd=hwnd,
                 )
-                append_audit({"op": "navigate", "mode": "desktop", "action": action, "url": url, "tab_id": tab_id})
+                append_audit({"op": "navigate", "mode": self.target_mode, "action": action, "url": url, "tab_id": tab_id})
                 self._emit_status("running" if self.task_state == "running" else "idle", f"导航完成 · {res.get('title', '')[:28]}")
                 return {"status": "ok", **res}
 
@@ -2400,7 +2675,7 @@ class ChromeCUAEngine:
     def locate(self, instruction: str, zoom: bool = False) -> dict[str, Any]:
         with self._lock:
             self._emit_status("running", "正在视觉定位目标…")
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 info, raw_img = self._capture_desktop_window(focus=False)
             else:
                 info, raw_img = self.chrome.capture_full_window()
@@ -2428,8 +2703,8 @@ class ChromeCUAEngine:
                     "usage": None,
                     "local_usage": local_usage,
                 }
-                if self.target_mode == "desktop":
-                    err_out["mode"] = "desktop"
+                if self._is_desktop_like():
+                    err_out["mode"] = self.target_mode
                 return err_out
 
             if zoom and parsed is not None and parsed.coordinate is not None:
@@ -2455,8 +2730,8 @@ class ChromeCUAEngine:
                         "usage": usage,
                         "local_usage": local_usage,
                     }
-                    if self.target_mode == "desktop":
-                        err_out["mode"] = "desktop"
+                    if self._is_desktop_like():
+                        err_out["mode"] = self.target_mode
                     return err_out
 
             screen_pt = norm_to_screen(*parsed.coordinate, info.dwm_rect) if (parsed and parsed.coordinate) else None
@@ -2473,8 +2748,8 @@ class ChromeCUAEngine:
                 "usage": usage,
                 "local_usage": local_usage,
             }
-            if self.target_mode == "desktop":
-                out["mode"] = "desktop"
+            if self._is_desktop_like():
+                out["mode"] = self.target_mode
             return out
 
     def dismiss_popup(self) -> dict[str, Any]:
@@ -2483,7 +2758,8 @@ class ChromeCUAEngine:
             local_usage = _new_local_usage()
             vision_action: str | None = None
 
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
+                mode_tag = getattr(self, "target_mode", "desktop")
                 info, raw_img = self._capture_desktop_window(focus=False)
                 method = "none"
                 try:
@@ -2491,22 +2767,22 @@ class ChromeCUAEngine:
                     _accumulate_usage(local_usage, usage)
                 except VLMCallError as exc:
                     _accumulate_usage(local_usage, None)
-                    append_audit({"op": "dismiss_popup", "mode": "desktop", "method": "vision_error", "error": str(exc), "local_usage": local_usage})
+                    append_audit({"op": "dismiss_popup", "mode": mode_tag, "method": "vision_error", "error": str(exc), "local_usage": local_usage})
                     self._emit_status("error", "弹窗识别模型调用失败")
                     return {
                         "status": "vlm_error",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "method": "vision_error",
                         "reason": str(exc),
                         "popup_detected": True,
                         "local_usage": local_usage,
                     }
                 except Exception as exc:
-                    append_audit({"op": "dismiss_popup", "mode": "desktop", "method": "vision_error", "error": str(exc), "local_usage": local_usage})
+                    append_audit({"op": "dismiss_popup", "mode": mode_tag, "method": "vision_error", "error": str(exc), "local_usage": local_usage})
                     self._emit_status("error", "弹窗关闭尝试失败")
                     return {
                         "status": "exec_failed",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "method": "vision_error",
                         "reason": str(exc),
                         "popup_detected": True,
@@ -2522,11 +2798,11 @@ class ChromeCUAEngine:
                             focused = self._focus_and_verify_desktop(info, settle_s=0.16)
                             ok, _ = execute_action(parsed, focused.hwnd, focused.dwm_rect)
                     except RuntimeError as exc:
-                        append_audit({"op": "dismiss_popup", "mode": "desktop", "method": "vision_exec_failed", "error": str(exc), "local_usage": local_usage})
+                        append_audit({"op": "dismiss_popup", "mode": mode_tag, "method": "vision_exec_failed", "error": str(exc), "local_usage": local_usage})
                         self._emit_status("error", "关闭弹窗前窗口聚焦失败")
                         return {
                             "status": "exec_failed",
-                            "mode": "desktop",
+                            "mode": mode_tag,
                             "method": "vision_exec_failed",
                             "vision_action": vision_action,
                             "reason": str(exc),
@@ -2548,11 +2824,11 @@ class ChromeCUAEngine:
                         method = f"{method}+escape" if method != "none" else "escape"
                         time.sleep(0.25)
                     except RuntimeError as exc:
-                        append_audit({"op": "dismiss_popup", "mode": "desktop", "method": f"{method}+escape_failed", "error": str(exc), "local_usage": local_usage})
+                        append_audit({"op": "dismiss_popup", "mode": mode_tag, "method": f"{method}+escape_failed", "error": str(exc), "local_usage": local_usage})
                         self._emit_status("error", "Escape 关闭弹窗前聚焦失败")
                         return {
                             "status": "exec_failed",
-                            "mode": "desktop",
+                            "mode": mode_tag,
                             "method": f"{method}+escape_failed" if method != "none" else "escape_failed",
                             "vision_action": vision_action,
                             "reason": str(exc),
@@ -2560,11 +2836,11 @@ class ChromeCUAEngine:
                             "local_usage": local_usage,
                         }
 
-                append_audit({"op": "dismiss_popup", "mode": "desktop", "method": method, "vision_action": vision_action, "local_usage": local_usage})
+                append_audit({"op": "dismiss_popup", "mode": mode_tag, "method": method, "vision_action": vision_action, "local_usage": local_usage})
                 self._emit_status("running" if self.task_state == "running" else "idle", "已尝试关闭弹窗")
                 return {
                     "status": "ok",
-                    "mode": "desktop",
+                    "mode": mode_tag,
                     "method": method,
                     "vision_action": vision_action,
                     "popup_detected": False,
@@ -2637,12 +2913,12 @@ class ChromeCUAEngine:
 
     def extract(self, selector: str | None = None, max_chars: int = 4000) -> dict[str, Any]:
         with self._lock:
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 info, raw_img = self._capture_desktop_window(focus=False)
                 perc = self._perceive_desktop(info, raw_img, max_elements=80, max_chars=max_chars)
-                return {
+                out_ext: dict[str, Any] = {
                     "status": "ok",
-                    "mode": "desktop_vision",
+                    "mode": "desktop_vision" if self.target_mode == "desktop" else "os",
                     "hwnd": info.hwnd,
                     "url": perc["url"],
                     "title": info.title,
@@ -2651,8 +2927,15 @@ class ChromeCUAEngine:
                     "ocr_elements": _compact_ocr_elements(perc["ocr_elements"]),
                     "ocr_ms": perc["ocr_ms"],
                     "links": [],
-                    "note": "桌面 Chrome 视觉模式已通过本地 WinRT OCR 提取页面文字与元素坐标；如需图像细节判断可调用 cua_ask_screen，或切至 managed 模式提取 DOM。",
+                    "note": (
+                        "桌面 Chrome 视觉模式已通过本地 WinRT OCR 提取页面文字与元素坐标；如需图像细节判断可调用 cua_ask_screen，或切至 managed 模式提取 DOM。"
+                        if self.target_mode == "desktop"
+                        else "全桌面 OS 视觉模式已通过本地 WinRT OCR 提取当前画面文字与元素坐标；如需图像细节判断可调用 cua_ask_screen。"
+                    ),
                 }
+                if self.target_mode == "os":
+                    out_ext["process"] = perc.get("process", "")
+                return out_ext
 
             self.chrome.ensure_started()
             assert self.chrome.cdp is not None
@@ -2729,7 +3012,7 @@ class ChromeCUAEngine:
             raise ValueError("question is required for ask_screen")
         with self._lock:
             self._begin_auto_step(f"本地读屏: {str(question).strip()[:28]}")
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 info, raw_img = self._capture_desktop_window(focus=False)
                 perc = self._perceive_desktop(info, raw_img, max_elements=60, max_chars=1200)
                 ocr_ctx = perc["page_text"]
@@ -2810,11 +3093,12 @@ class ChromeCUAEngine:
         wait_settle: bool = False,
         include_text: bool = False,
     ) -> dict[str, Any]:
+        mode_tag = getattr(self, "target_mode", "desktop")
         if element_id is not None and ocr_id is None and not text_hint and not instruction and action_json is None:
             return {
                 "status": "not_found",
-                "mode": "desktop",
-                "reason": "desktop 模式无 DOM element_id，请提供 ocr_id、text_hint、instruction 或 action_json",
+                "mode": mode_tag,
+                "reason": f"{mode_tag} 模式无 DOM element_id，请提供 ocr_id、text_hint、instruction 或 action_json",
             }
         t_start = time.perf_counter()
         info, raw_img = self._capture_desktop_window(focus=False)
@@ -2823,13 +3107,13 @@ class ChromeCUAEngine:
         inst_str = instruction or text_hint or (json.dumps(action_json, ensure_ascii=False) if action_json else "")
         policy = evaluate_policy(inst_str, element_meta=None, gate_reason=gate)
         if policy.tier == "takeover":
-            append_audit({"op": "act", "mode": "desktop", "blocked": "takeover", "reason": policy.matched_rule, "title": info.title})
+            append_audit({"op": "act", "mode": mode_tag, "blocked": "takeover", "reason": policy.matched_rule, "title": info.title})
             self.task_state = "confirm"
             self.task_step_label = policy.reason[:60]
             self._emit_status("confirm", policy.reason, event_kind="task_alert", play_sound=True)
             return {
                 "status": "needs_human_takeover",
-                "mode": "desktop",
+                "mode": mode_tag,
                 "reason": policy.reason,
                 "gate": policy.matched_rule,
                 "url": self.active_url,
@@ -2837,13 +3121,13 @@ class ChromeCUAEngine:
             }
         if policy.tier == "red" and not self._consume_confirm_token(confirm_token, inst_str, None):
             tok = self._make_confirm_token(inst_str, None)
-            append_audit({"op": "act", "mode": "desktop", "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_str})
+            append_audit({"op": "act", "mode": mode_tag, "blocked": "red_tier", "rule": policy.matched_rule, "instruction": inst_str})
             self.task_state = "confirm"
             self.task_step_label = policy.reason[:60]
             self._emit_status("confirm", policy.reason, event_kind="task_alert", play_sound=True)
             return {
                 "status": "needs_human_confirmation",
-                "mode": "desktop",
+                "mode": mode_tag,
                 "confirm_token": tok,
                 "reason": policy.reason,
                 "matched_rule": policy.matched_rule,
@@ -2874,7 +3158,7 @@ class ChromeCUAEngine:
                 elif not instruction:
                     return {
                         "status": "not_found",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "reason": f"未在当前画面找到 ocr_id={ocr_id}",
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
@@ -2887,7 +3171,7 @@ class ChromeCUAEngine:
                 if gate:
                     return {
                         "status": "needs_human_takeover",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "reason": f"检测到人机验证或登录拦截（{gate}），需人工接管。",
                         "gate": gate,
                         "url": perc_now["url"],
@@ -2906,7 +3190,7 @@ class ChromeCUAEngine:
                 elif strategy == "ocr" or not instruction:
                     return {
                         "status": "not_found",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "reason": f"OCR 未找到唯一匹配目标「{query_lbl}」",
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
@@ -2914,7 +3198,7 @@ class ChromeCUAEngine:
 
             if parsed is None:
                 if not instruction:
-                    raise ValueError("Provide instruction, text_hint, ocr_id, or action_json in desktop mode")
+                    raise ValueError("Provide instruction, text_hint, ocr_id, or action_json in desktop/os mode")
                 grounding_source = "m35_vision"
                 try:
                     raw_text, parsed, infer_s, usage = self.grounder.predict(raw_img, instruction)
@@ -2924,21 +3208,21 @@ class ChromeCUAEngine:
                     self._emit_status("error", "本地模型调用失败", event_kind="status", play_sound=False)
                     return {
                         "status": "vlm_error",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "reason": str(exc),
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
                 if parsed is None:
                     self._emit_status("error", "模型输出格式无效", event_kind="status", play_sound=False)
-                    return {"status": "invalid_json", "mode": "desktop", "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
+                    return {"status": "invalid_json", "mode": mode_tag, "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
                 if parsed.action == "not_found":
                     self.step_count += 1
-                    append_audit({"op": "act", "mode": "desktop", "action": "not_found", "instruction": instruction, "reason": parsed.reason})
+                    append_audit({"op": "act", "mode": mode_tag, "action": "not_found", "instruction": instruction, "reason": parsed.reason})
                     self._emit_status("running" if self.task_state == "running" else "idle", "未在当前画面找到目标")
                     return {
                         "status": "not_found",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "reason": parsed.reason,
                         "raw_prediction": raw_text,
                         "infer_s": round(infer_s, 4),
@@ -2953,7 +3237,7 @@ class ChromeCUAEngine:
                     self._emit_status("error", "已急停（光标在左上角安全区）", event_kind="task_error", play_sound=True)
                     return {
                         "status": "exec_failed",
-                        "mode": "desktop",
+                        "mode": mode_tag,
                         "exec_status": "failsafe_corner_triggered",
                         "action": parsed.action,
                         "local_usage": local_usage,
@@ -2961,10 +3245,15 @@ class ChromeCUAEngine:
                     }
                 focused = self._focus_and_verify_desktop(info, settle_s=0.16)
                 if focused.dwm_rect != info.dwm_rect:
-                    try:
-                        raw_img = print_window_dwm(focused)
-                    except Exception:
-                        raw_img = capture_chrome_window(focused)
+                    if focused.hwnd == 0:
+                        raw_img = capture_roi(focused.dwm_rect)
+                    else:
+                        try:
+                            raw_img = print_window_dwm(focused)
+                            if self.target_mode == "os" and int(np.asarray(raw_img).max()) == 0:
+                                raise RuntimeError("print_window_blank")
+                        except Exception:
+                            raw_img = capture_roi(focused.dwm_rect) if self.target_mode == "os" else capture_chrome_window(focused)
                     info = focused
                     if instruction and action_json is None and grounding_source == "m35_vision":
                         try:
@@ -2976,20 +3265,20 @@ class ChromeCUAEngine:
                             self._emit_status("error", "重拍后本地模型调用失败")
                             return {
                                 "status": "vlm_error",
-                                "mode": "desktop",
+                                "mode": mode_tag,
                                 "reason": str(exc),
                                 "local_usage": local_usage,
                                 "elapsed_s": round(time.perf_counter() - t_start, 4),
                             }
                         if parsed is None:
                             self._emit_status("error", "模型输出格式无效")
-                            return {"status": "invalid_json", "mode": "desktop", "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
+                            return {"status": "invalid_json", "mode": mode_tag, "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
                         if parsed.action == "not_found":
                             self.step_count += 1
                             self._emit_status("running" if self.task_state == "running" else "idle", "未在当前画面找到目标")
                             return {
                                 "status": "not_found",
-                                "mode": "desktop",
+                                "mode": mode_tag,
                                 "reason": parsed.reason,
                                 "raw_prediction": raw_text,
                                 "infer_s": round(infer_s, 4),
@@ -2998,10 +3287,10 @@ class ChromeCUAEngine:
                             }
                 exec_ok, exec_status = execute_action(parsed, focused.hwnd, focused.dwm_rect)
         except RuntimeError as exc:
-            self._emit_status("error", "桌面 Chrome 前景聚焦失败")
+            self._emit_status("error", "目标窗口前景聚焦失败" if mode_tag == "os" else "桌面 Chrome 前景聚焦失败")
             return {
                 "status": "exec_failed",
-                "mode": "desktop",
+                "mode": mode_tag,
                 "exec_status": str(exc),
                 "reason": str(exc),
                 "action": parsed.action if parsed else None,
@@ -3082,7 +3371,7 @@ class ChromeCUAEngine:
         elapsed = time.perf_counter() - t_start
         append_audit({
             "op": "act",
-            "mode": "desktop",
+            "mode": mode_tag,
             "instruction": instruction,
             "grounding_source": grounding_source,
             "action": parsed.action if parsed else exec_status,
@@ -3094,7 +3383,7 @@ class ChromeCUAEngine:
         self._emit_status("running" if exec_ok and self.task_state == "running" else ("idle" if exec_ok else "error"), step_msg)
         out: dict[str, Any] = {
             "status": "ok" if exec_ok else "exec_failed",
-            "mode": "desktop",
+            "mode": mode_tag,
             "hwnd": post_info.hwnd,
             "grounding_source": grounding_source,
             "exec_status": exec_status,
@@ -3132,6 +3421,7 @@ class ChromeCUAEngine:
         text_hint: str | None = None,
         wait_settle: bool = False,
         include_text: bool = False,
+        scroll_retry: int = 0,
     ) -> dict[str, Any]:
         if self.abort_event.is_set():
             return {"status": "aborted", "reason": "aborted_by_user"}
@@ -3144,7 +3434,7 @@ class ChromeCUAEngine:
                 or (f"元素#{element_id}" if element_id is not None else f"动作:{(action_json or {}).get('action', '') if isinstance(action_json, dict) else 'exec'}")
             )
             self._begin_auto_step(step_lbl)
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 return self._act_desktop(
                     instruction,
                     element_id,
@@ -3247,18 +3537,74 @@ class ChromeCUAEngine:
                     if text_hint:
                         return {"status": "not_found", "reason": f"未在当前页面找到「{text_hint}」", "local_usage": local_usage}
                     raise ValueError("Provide at least one of instruction, element_id, text_hint, or action_json")
-                try:
-                    raw_text, parsed, infer_s, usage = self.grounder.predict(raw_img, instruction)
-                    _accumulate_usage(local_usage, usage)
-                except VLMCallError as exc:
-                    _accumulate_usage(local_usage, None)
-                    self._emit_status("error", "本地模型调用失败")
-                    return {
-                        "status": "vlm_error",
-                        "reason": str(exc),
-                        "local_usage": local_usage,
-                        "elapsed_s": round(time.perf_counter() - t_start, 4),
-                    }
+                scroll_find_attempts = 0
+                scroll_sem = bool(instruction and re.search(r"滚动|下滑|上滑|翻页|scroll|swipe", instruction, re.I))
+                find_sem = bool(instruction and re.search(r"找|搜|滚动|翻|scroll|find|search", instruction, re.I))
+                remaining_scroll = max(0, int(scroll_retry))
+                if remaining_scroll == 0 and find_sem and not scroll_sem:
+                    remaining_scroll = 2  # instruction implies searching — allow scroll-and-retry
+                chain_budget = 2  # model-initiated scroll chaining (M4 web_scroll_find loop)
+
+                def _scroll_state_y() -> tuple[float, float]:
+                    try:
+                        st_raw = self.chrome.cdp.evaluate(
+                            "JSON.stringify({y:window.scrollY||document.documentElement.scrollTop||0,max:Math.max(0,(document.documentElement.scrollHeight||0)-window.innerHeight)})"
+                        )
+                        st = json.loads(st_raw) if isinstance(st_raw, str) else {}
+                        return float(st.get("y", 0.0)), float(st.get("max", 0.0))
+                    except Exception:
+                        return 0.0, 0.0
+
+                def _scroll_and_recapture(scroll_action) -> bool:
+                    nonlocal info, raw_img, snap, w_dwm, h_dwm
+                    self.chrome.dispatch_viewport_action(scroll_action, info, raw_img.size)
+                    time.sleep(0.35)
+                    info, raw_img = self.chrome.capture_full_window()
+                    w_dwm, h_dwm = raw_img.size
+                    snap = self.chrome.extract_dom_snapshot(info, w_dwm, h_dwm, max_elements=60)
+
+                while True:
+                    try:
+                        raw_text, parsed, infer_s, usage = self.grounder.predict(raw_img, instruction)
+                        _accumulate_usage(local_usage, usage)
+                    except VLMCallError as exc:
+                        _accumulate_usage(local_usage, None)
+                        self._emit_status("error", "本地模型调用失败")
+                        return {
+                            "status": "vlm_error",
+                            "reason": str(exc),
+                            "local_usage": local_usage,
+                            "elapsed_s": round(time.perf_counter() - t_start, 4),
+                        }
+                    if parsed is None:
+                        break
+                    if parsed.action == "not_found":
+                        if remaining_scroll <= 0:
+                            break
+                        y_before, y_max = _scroll_state_y()
+                        if y_max <= y_before + 4:
+                            break  # page not scrollable or already at bottom
+                        remaining_scroll -= 1
+                        scroll_find_attempts += 1
+                        self._emit_status("running", "未找到目标，滚动后继续查找")
+                        sp = ParsedAction(action="scroll", coordinate=[500, 720], direction="down", amount=4)
+                        _scroll_and_recapture(sp)
+                        y_after, _ = _scroll_state_y()
+                        if abs(y_after - y_before) <= 2:
+                            break  # scroll had no effect — stop retrying
+                        continue
+                    if parsed.action == "scroll" and not scroll_sem and chain_budget > 0:
+                        # model itself chose to scroll to reveal the target — execute and re-ground in-loop
+                        chain_budget -= 1
+                        scroll_find_attempts += 1
+                        y_before, _ = _scroll_state_y()
+                        self._emit_status("running", "滚动查找目标中")
+                        _scroll_and_recapture(parsed)
+                        y_after, _ = _scroll_state_y()
+                        if abs(y_after - y_before) <= 2:
+                            break  # cannot scroll further — let final prediction stand
+                        continue
+                    break
                 if parsed is None:
                     self._emit_status("error", "模型输出格式无效")
                     return {"status": "invalid_json", "raw_prediction": raw_text, "local_usage": local_usage, "elapsed_s": round(time.perf_counter() - t_start, 4)}
@@ -3271,6 +3617,7 @@ class ChromeCUAEngine:
                         "reason": parsed.reason,
                         "raw_prediction": raw_text,
                         "infer_s": round(infer_s, 4),
+                        "scroll_find_attempts": scroll_find_attempts,
                         "local_usage": local_usage,
                         "elapsed_s": round(time.perf_counter() - t_start, 4),
                     }
@@ -3409,7 +3756,7 @@ class ChromeCUAEngine:
         hint = spec.get("text_hint")
         inst_pol = f"{target_inst or ''} {hint or ''} {text_val}".strip()
 
-        gate = self._check_desktop_title_gate(self.active_title) if self.target_mode == "desktop" else None
+        gate = self._check_desktop_title_gate(self.active_title) if self._is_desktop_like() else None
         policy = evaluate_policy(inst_pol, element_meta=None, gate_reason=gate)
         if policy.tier == "takeover":
             return {"status": "needs_human_takeover", "reason": policy.reason, "gate": policy.matched_rule}
@@ -3434,13 +3781,13 @@ class ChromeCUAEngine:
         submitted: bool | None = None
         submission_state = "not_requested"
         submission_evidence = "not_requested"
-        if self.target_mode == "desktop":
+        if self._is_desktop_like():
             info_now = self._resolve_desktop_window(focus=False)
             old_title = info_now.title
             before_img: Image.Image | None = None
             if wait_settle and not press_enter:
                 try:
-                    before_img = print_window_dwm(info_now)
+                    before_img = capture_roi(info_now.dwm_rect) if info_now.hwnd == 0 else print_window_dwm(info_now)
                 except Exception:
                     before_img = None
             pre_enter_info: ChromeWindowInfo | None = None
@@ -3451,7 +3798,7 @@ class ChromeCUAEngine:
                     if check_corner_failsafe():
                         err_res: dict[str, Any] = {
                             "status": "exec_failed",
-                            "mode": "desktop",
+                            "mode": self.target_mode,
                             "exec_status": "failsafe_corner_triggered",
                         }
                         if isinstance(click_res.get("local_usage"), dict):
@@ -3468,17 +3815,25 @@ class ChromeCUAEngine:
                         time.sleep(0.05)
                     if press_enter:
                         try:
-                            pre_enter_info = inspect_chrome_window(focused.hwnd)
-                            pre_enter_img = print_window_dwm(pre_enter_info)
+                            if focused.hwnd == 0:
+                                pre_enter_info = inspect_primary_screen()
+                                pre_enter_img = capture_roi(pre_enter_info.dwm_rect)
+                            else:
+                                pre_enter_info = inspect_chrome_window(focused.hwnd)
+                                pre_enter_img = print_window_dwm(pre_enter_info)
                         except Exception:
                             pre_enter_info = focused
                             pre_enter_img = None
-                        pre_enter_url = self._read_desktop_url_safe(pre_enter_info) or self.active_url
+                        pre_enter_url = (
+                            (self._read_desktop_url_safe(pre_enter_info) or self.active_url)
+                            if self.target_mode == "desktop"
+                            else ""
+                        )
                         send_hotkey(["enter"])
             except RuntimeError as exc:
                 err_res = {
                     "status": "exec_failed",
-                    "mode": "desktop",
+                    "mode": self.target_mode,
                     "exec_status": str(exc),
                     "reason": str(exc),
                 }
@@ -3512,7 +3867,11 @@ class ChromeCUAEngine:
                     meta_out=settle_meta,
                 )
                 self.active_title = post_info.title
-                post_url = str((cached_perc or {}).get("url") or self._read_desktop_url_safe(post_info) or self.active_url)
+                post_url = (
+                    str((cached_perc or {}).get("url") or self._read_desktop_url_safe(post_info) or self.active_url)
+                    if self.target_mode == "desktop"
+                    else ""
+                )
                 if post_url:
                     self.active_url = post_url
                 if press_enter:
@@ -3537,18 +3896,25 @@ class ChromeCUAEngine:
             elif press_enter:
                 time.sleep(0.15)
                 try:
-                    post_info = inspect_chrome_window(focused.hwnd) if win32gui.IsWindow(focused.hwnd) else focused
+                    if focused.hwnd == 0:
+                        post_info = inspect_primary_screen()
+                    else:
+                        post_info = inspect_chrome_window(focused.hwnd) if win32gui.IsWindow(focused.hwnd) else focused
                 except Exception:
                     post_info = focused
                 self.active_title = post_info.title
-                post_url = self._read_desktop_url_safe(post_info) or self.active_url
+                post_url = (
+                    (self._read_desktop_url_safe(post_info) or self.active_url)
+                    if self.target_mode == "desktop"
+                    else ""
+                )
                 if post_url:
                     self.active_url = post_url
                 until_matched_now = True
                 if until_targets:
                     post_txt = ""
                     try:
-                        post_shot = print_window_dwm(post_info)
+                        post_shot = capture_roi(post_info.dwm_rect) if post_info.hwnd == 0 else print_window_dwm(post_info)
                         post_ocr = self._desktop_ocr.recognize(post_shot, max_elements=40, max_chars=2400)
                         post_txt = str((post_ocr or {}).get("page_text") or "")
                     except Exception:
@@ -3778,7 +4144,7 @@ class ChromeCUAEngine:
             if idx == max_scrolls:
                 break
 
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 _, cur_img = self._capture_desktop_window(focus=False)
             else:
                 _, cur_img = self.chrome.capture_full_window()
@@ -3824,7 +4190,7 @@ class ChromeCUAEngine:
         until_text = spec.get("until_text")
         targets = self._resolve_until_texts(until_text)
         max_wait_s = min(max(0.3, float(spec.get("max_wait_s", 4.0))), 12.0)
-        if self.target_mode == "desktop":
+        if self._is_desktop_like():
             info = self._resolve_desktop_window(focus=False)
             cur_info, cur_img, cached_perc = self._wait_desktop_frame_settle(
                 info.hwnd,
@@ -3913,7 +4279,7 @@ class ChromeCUAEngine:
             pre_img: Image.Image | None = None
             pre_info: ChromeWindowInfo | None = None
 
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 pre_info, pre_img = self._capture_desktop_window(focus=False)
                 gate = self._check_desktop_title_gate(pre_info.title)
                 if gate:
@@ -3984,6 +4350,16 @@ class ChromeCUAEngine:
                         wait_settle=bool(spec.get("wait_settle", False)),
                         include_screenshot=False,
                     )
+                elif kind == "drag":
+                    res = self.act(
+                        action_json={
+                            "action": "drag",
+                            "coordinate": list(spec.get("coordinate") or [0, 0]),
+                            "end_coordinate": list(spec.get("end_coordinate") or spec.get("to") or [0, 0]),
+                        },
+                        wait_settle=bool(spec.get("wait_settle", False)),
+                        include_screenshot=False,
+                    )
                 else:
                     res = self.act(
                         instruction=spec.get("instruction") or spec.get("target"),
@@ -4029,7 +4405,7 @@ class ChromeCUAEngine:
                 stagnant_streak = 0
                 continue
 
-            if self.target_mode == "desktop":
+            if self._is_desktop_like():
                 eff = res.get("click_effect") if isinstance(res.get("click_effect"), dict) else None
                 if eff and eff.get("effective"):
                     stagnant_streak = 0

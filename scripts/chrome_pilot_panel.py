@@ -303,38 +303,60 @@ def format_human_action(parsed: ParsedAction) -> str:
         return f"{d_map.get(parsed.direction or 'down', '')}滚动 {parsed.amount or 3} 格"
     if act == "hotkey":
         return f"按下快捷键 {' + '.join(parsed.keys or ())}"
+    if act == "drag":
+        return f"拖拽 {list(parsed.coordinate or ())} → {list(parsed.end_coordinate or ())}"
     if act == "not_found":
         return parsed.reason or "当前画面未找到目标"
     return act
 
 
 class SoundCuePlayer:
-    """Pure-stdlib async soft harmonic WAV chimes for connect/done/alert/error events."""
+    """Pure-stdlib async glass-chime WAV cues (or custom assets/sounds/*.wav) for connect/done/alert/error events."""
 
     def __init__(self) -> None:
-        self._clips: dict[str, bytes] = {
-            "connect": self._synth([(784.0, 0.11)]),
-            "done": self._synth([(1046.5, 0.10), (1318.51, 0.19)]),
-            "alert": self._synth([(880.0, 0.08), (0.0, 0.05), (880.0, 0.08)]),
-            "error": self._synth([(523.25, 0.10), (392.0, 0.16)]),
+        presets: dict[str, list[tuple[float, float]]] = {
+            "connect": [(784.0, 0.14)],
+            "done": [(1046.5, 0.09), (1318.51, 0.10), (1567.98, 0.30)],
+            "alert": [(880.0, 0.10), (0.0, 0.05), (880.0, 0.14)],
+            "error": [(523.25, 0.11), (392.0, 0.22)],
         }
+        self._clips: dict[str, bytes] = {kind: self._load_or_synth(kind, notes) for kind, notes in presets.items()}
+
+    @classmethod
+    def _load_or_synth(cls, kind: str, notes: list[tuple[float, float]]) -> bytes:
+        custom = PROJECT_ROOT / "assets" / "sounds" / f"{kind}.wav"
+        try:
+            if custom.is_file():
+                data = custom.read_bytes()
+                if data[:4] == b"RIFF":
+                    return data
+        except Exception:
+            pass
+        return cls._synth(notes)
 
     @staticmethod
-    def _synth(notes: list[tuple[float, float]], sample_rate: int = 22050, amp: float = 0.20) -> bytes:
+    def _synth(notes: list[tuple[float, float]], sample_rate: int = 44100, amp: float = 0.36) -> bytes:
         frames = bytearray()
-        fade_len = max(1, int(sample_rate * 0.015))
+        attack_len = max(1, int(sample_rate * 0.008))
+        fade_out_len = max(1, int(sample_rate * 0.025))
         for freq, dur_s in notes:
             total = max(1, int(sample_rate * dur_s))
+            dur_safe = max(dur_s, 0.05)
             for i in range(total):
                 if freq <= 0.0:
                     sample = 0
                 else:
-                    env = 1.0
-                    if i < fade_len:
-                        env = i / fade_len
-                    elif total - i < fade_len * 2:
-                        env = max(0.0, (total - i) / (fade_len * 2))
-                    val = math.sin(2.0 * math.pi * freq * (i / sample_rate)) * amp * env
+                    t = i / sample_rate
+                    env = min(1.0, i / attack_len)
+                    if total - i < fade_out_len:
+                        env *= max(0.0, (total - i) / fade_out_len)
+                    decay = math.exp(-3.2 * t / dur_safe)
+                    wave_mix = (
+                        0.72 * math.sin(2.0 * math.pi * freq * t)
+                        + 0.20 * math.sin(4.0 * math.pi * freq * t)
+                        + 0.08 * math.sin(6.0 * math.pi * freq * t)
+                    )
+                    val = wave_mix * amp * env * decay
                     sample = max(-32767, min(32767, int(val * 32767)))
                 frames.extend(struct.pack("<h", sample))
         buf = io.BytesIO()
@@ -1224,6 +1246,7 @@ class ChromePilotPanel:
         widget.bind("<B1-Motion>", self._on_drag)
 
     STALE_S = 120.0
+    AUTO_DONE_S = 12.0
 
     def _build_ui(self) -> None:
         inner_w = self.PANEL_W - 2 * self.SHELL_PADX
@@ -1379,7 +1402,8 @@ class ChromePilotPanel:
 
         self.target_dd = Dropdown(
             r1, self._target_rows, self._target_key(), self._choose_target,
-            display=lambda key: "后台托管" if key == "managed" else "本机 Chrome", tip=self._target_tip,
+            display=lambda key: "后台托管" if key == "managed" else ("全桌面" if isinstance(key, tuple) and key[0] == "os" else "本机 Chrome"),
+            tip=self._target_tip,
         )
         self.mode_dd = Dropdown(
             r1,
@@ -1428,18 +1452,22 @@ class ChromePilotPanel:
         self._set_model(f"{self._split_model(self.model_choice)[0]} · {quant}")
 
     def _target_key(self) -> Any:
+        if self.target_mode == "os":
+            return ("os", self.selected_hwnd)
         return ("desktop", self.selected_hwnd) if self.target_mode == "desktop" and self.selected_hwnd else "managed"
 
     def _target_tip(self) -> str:
+        if self.target_mode == "os":
+            return f"全桌面模式：{self.engine.active_title or '主屏'}"
         if self.target_mode != "desktop":
             return "独立的后台 Chrome，不动你的窗口"
         cur = next((w for w in self.desktop_windows if w.hwnd == self.selected_hwnd), None)
         return cur.title if cur is not None and cur.title else "你正在用的、已登录的 Chrome"
 
     def _target_rows(self) -> list[tuple[Any, str]]:
-        """Background Chrome, then every open desktop Chrome window (re-scanned each time the list opens)."""
+        """Background Chrome, OS full-screen mode, and open desktop Chrome windows."""
         self._refresh_desktop_windows(silent=True)
-        rows: list[tuple[Any, str]] = [("managed", "后台托管 Chrome"), (None, "")]
+        rows: list[tuple[Any, str]] = [("managed", "后台托管 Chrome"), (("os", 0), "全桌面主屏（任意应用）"), (None, "")]
         if not self.desktop_windows:
             return rows + [(None, "未找到桌面 Chrome 窗口")]
         rows.append((None, "本机 Chrome 窗口"))
@@ -1451,6 +1479,9 @@ class ChromePilotPanel:
     def _choose_target(self, key: Any) -> None:
         if key == "managed":
             self._set_target_mode("managed")
+        elif isinstance(key, tuple) and key[0] == "os":
+            self.selected_hwnd = int(key[1])
+            self._set_target_mode("os")
         else:
             self.selected_hwnd = int(key[1])
             self._set_target_mode("desktop")
@@ -1468,6 +1499,8 @@ class ChromePilotPanel:
 
     def _toggle_sound(self) -> None:
         self.set_sound_enabled(not self.sound_enabled)
+        if self.sound_enabled:
+            self.sound.play("done", True)
 
     def _toggle_effects(self) -> None:
         self.set_effects_enabled(not self.effects_enabled)
@@ -1696,6 +1729,9 @@ class ChromePilotPanel:
         if self._closed or self.engine.task_state != "running" or self.engine.task_started_at <= 0.0:
             return
         now = time.monotonic()
+        if not self.busy and not getattr(self.engine, "task_explicit", False) and (now - self.engine.task_last_activity) >= self.AUTO_DONE_S:
+            self.engine.complete_auto_task(message="任务已完成", play_sound=True)
+            return
         if not self.busy and now - self.engine.task_last_activity > self.STALE_S:
             self._quiet_stale_task()
             return
@@ -1736,6 +1772,17 @@ class ChromePilotPanel:
         """Render a task snapshot: message on the left, `HARNESS · 3/5 · 12.4s` on the right, nothing at all when idle."""
         if self._closed:
             return
+        tmode = st.get("target_mode")
+        if tmode in {"managed", "desktop", "os"} and hasattr(self, "target_dd"):
+            dhwnd = int(st.get("desktop_hwnd") or 0)
+            if tmode != self.target_mode or (tmode in {"desktop", "os"} and dhwnd != self.selected_hwnd):
+                self.target_mode = str(tmode)
+                if tmode in {"desktop", "os"}:
+                    self.selected_hwnd = dhwnd
+                try:
+                    self.target_dd.set_value(self._target_key())
+                except Exception:
+                    pass
         active_harness = str(st.get("active_harness") or "")
         harness_mode = str(st.get("harness_mode") or "none")
         clients = int(st.get("mcp_clients", 0))
@@ -1802,7 +1849,8 @@ class ChromePilotPanel:
         self.target_mode = mode
         self._refresh_desktop_windows(silent=True)
         try:
-            self.engine.set_target_mode(mode, self.selected_hwnd if mode == "desktop" and self.selected_hwnd else None)
+            hwnd_arg = self.selected_hwnd if (mode == "desktop" and self.selected_hwnd) or mode == "os" else None
+            self.engine.set_target_mode(mode, hwnd_arg)
         except Exception:
             self.engine.target_mode = mode
         self._sync_drawer_styles()

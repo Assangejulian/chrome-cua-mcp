@@ -268,6 +268,7 @@ def run_single_prediction(
 def default_local_model(models_root: Path = PROJECT_ROOT / "models") -> tuple[Path, str, str]:
     """Return (model_dir, model_prefix, mmproj_name) for the newest available local GGUF model."""
     candidates = (
+        ("m4_gguf", "m4-qwen35-2b-", "m4-mmproj-f16.gguf"),
         ("m35_gguf", "m35-qwen35-2b-", "m35-mmproj-f16.gguf"),
         ("m3_gguf", "m3-qwen35-2b-", "m3-mmproj-f16.gguf"),
         ("m2_gguf", "m2-qwen35-2b-", "m2-mmproj-f16.gguf"),

@@ -17,6 +17,7 @@ import win32gui
 import win32process
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+DWMWA_CLOAKED = 14
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 PROCESS_PER_MONITOR_DPI_AWARE = 2
 
@@ -124,6 +125,110 @@ def inspect_chrome_window(hwnd: int) -> ChromeWindowInfo:
         dwm_rect=get_dwm_extended_frame_bounds(hwnd),
         client_rect=get_client_screen_rect(hwnd),
     )
+
+
+def get_window_process_name(hwnd: int) -> str:
+    """Return lowercase executable filename (e.g. 'chrome.exe', 'qq.exe') for a window, or ''."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return ""
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if not pid:
+            return ""
+        process = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            image = win32process.GetModuleFileNameEx(process, 0)
+        finally:
+            process.Close()
+        return Path(image).name.casefold()
+    except Exception:
+        return ""
+
+
+def get_primary_screen_rect() -> Rect:
+    """Return physical-pixel bounds of the primary monitor."""
+    user32 = ctypes.windll.user32
+    w = max(1, int(user32.GetSystemMetrics(0)))
+    h = max(1, int(user32.GetSystemMetrics(1)))
+    return Rect(0, 0, w, h)
+
+
+def inspect_primary_screen() -> ChromeWindowInfo:
+    """Build a synthetic window snapshot (hwnd=0) covering the full primary screen."""
+    rect = get_primary_screen_rect()
+    user32 = ctypes.windll.user32
+    dpi = int(user32.GetDpiForSystem()) if hasattr(user32, "GetDpiForSystem") else 96
+    if dpi <= 0:
+        dpi = 96
+    return ChromeWindowInfo(
+        hwnd=0,
+        title="Primary Screen",
+        dpi=dpi,
+        dpi_scale=round(dpi / 96.0, 4),
+        is_foreground=True,
+        is_minimized=False,
+        window_rect=rect,
+        dwm_rect=rect,
+        client_rect=rect,
+    )
+
+
+def _is_window_cloaked(hwnd: int) -> bool:
+    cloaked = ctypes.c_int(0)
+    try:
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd),
+            wintypes.DWORD(DWMWA_CLOAKED),
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
+def find_all_windows(
+    exclude_hwnds: set[int] | None = None,
+    min_width: int = 160,
+    min_height: int = 120,
+) -> list[tuple[ChromeWindowInfo, str]]:
+    """Enumerate visible top-level application windows across the Windows desktop."""
+    excluded = set(exclude_hwnds or ())
+    shell_classes = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+    matches: list[tuple[ChromeWindowInfo, str]] = []
+    pid_names: dict[int, str] = {}
+
+    def collect(hwnd: int, _: object) -> bool:
+        try:
+            if hwnd in excluded or not win32gui.IsWindowVisible(hwnd):
+                return True
+            if not win32gui.GetWindowText(hwnd):
+                return True
+            cls = win32gui.GetClassName(hwnd)
+            if cls in shell_classes:
+                return True
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if (ex_style & win32con.WS_EX_TOOLWINDOW) and not (ex_style & win32con.WS_EX_APPWINDOW):
+                return True
+            if _is_window_cloaked(hwnd):
+                return True
+            info = inspect_chrome_window(hwnd)
+            if not info.is_minimized and (info.dwm_rect.width < min_width or info.dwm_rect.height < min_height):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid not in pid_names:
+                pid_names[pid] = get_window_process_name(hwnd)
+            matches.append((info, pid_names[pid]))
+        except win32gui.error:
+            pass
+        finally:
+            ctypes.windll.kernel32.SetLastError(0)
+        return True
+
+    ctypes.windll.kernel32.SetLastError(0)
+    win32gui.EnumWindows(collect, None)
+    matches.sort(key=lambda pair: (not pair[0].is_foreground, pair[0].is_minimized, pair[1], pair[0].title))
+    return matches
 
 
 def find_chrome_windows() -> list[ChromeWindowInfo]:

@@ -19,22 +19,28 @@ if str(SCRIPT_DIR) not in sys.path:
 from cua_engine import ChromeCUAEngine
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
-SERVER_INFO = {"name": "chrome-pilot-cua", "version": "0.2.0"}
+SERVER_INFO = {"name": "chrome-pilot-cua", "version": "0.3.0"}
 MCP_INSTRUCTIONS = (
     "Chrome Pilot CUA is text-first and local-model-autonomous to save upper-LLM tokens and wall time:\n"
     "1) Zero-screenshot default: cua_observe, cua_navigate, cua_act, and cua_run_steps return real url, title, "
     "page_text/text_excerpt, clickable elements/ocr_elements, and click_effect directly in JSON. Only pass "
     "include_screenshot=true when raw pixel inspection is truly required.\n"
-    "2) Use local Qwen3.5 before requesting screenshots: call cua_ask_screen(question, around_last_click=...) "
+    "2) Use local Qwen3.5 (M4) before requesting screenshots: call cua_ask_screen(question, around_last_click=...) "
     "or pass verify_question to cua_run_steps to inspect post text, heart/toggle state, or counters (~0.2-1.2s). Note: "
     "verification_answer is only a local VLM text summary, not an authoritative business assertion.\n"
-    "3) Prefer direct URLs over manual search typing (e.g. https://x.com/search?q=from%3AOfficialLoganK%20gemini&f=live).\n"
-    "4) Batch 2-12 operations into ONE cua_run_steps call using structured steps: kind='goto', 'click_and_type' "
+    "3) Universal Windows Computer Use (mode='os'): call cua_navigate(action='list_windows', all_apps=True) to "
+    "enumerate all desktop apps, then cua_navigate(action='focus_window', hwnd=...) or set_mode(mode='os', hwnd=0) "
+    "for full primary screen. Supports drag via action_json/run_steps and extended keys (F1-F12, home/end/pgup/pgdn).\n"
+    "4) Prefer direct URLs over manual search typing in Chrome (e.g. https://x.com/search?q=from%3AOfficialLoganK%20gemini&f=live).\n"
+    "5) Batch 2-12 operations into ONE cua_run_steps call using structured steps: kind='goto', 'click_and_type' "
     "(atomic click+clear+paste+enter+settle; pass require_submit=true when subsequent steps depend on form/search submission, "
     "or expect_submit=false for multiline newlines/shortcuts; for async results without navigation provide a specific new until_text), "
-    "'scroll_until', 'wait_until', 'act', 'ask', 'dismiss_popup'.\n"
-    "5) Prefer element_id (managed) / ocr_id / text_hint for labeled text controls (0ms); use natural-language "
-    "instruction for icons or relative spatial targets."
+    "'scroll_until', 'wait_until', 'act', 'ask', 'dismiss_popup', 'drag'.\n"
+    "6) Prefer element_id (managed) / ocr_id / text_hint for labeled text controls (0ms); use natural-language "
+    "instruction for icons or relative spatial targets.\n"
+    "7) Task lifecycle feedback: for multi-step user tasks, call cua_task(event='start', title=..., total_steps=...) "
+    "at the start and ALWAYS call cua_task(event='done', message=...) (or 'error') when finished so the floating "
+    "bar immediately shows the green completion banner and plays the soft chime."
 )
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -59,7 +65,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "cua_navigate",
         "description": (
             "Navigate, wait for frame settle, and return page URL/title/OCR-or-DOM text; "
-            "or switch target mode ('desktop' logged-in Chrome vs 'managed' isolated Chrome)."
+            "or switch target mode ('desktop' Chrome, 'managed' Chrome, or 'os' any Windows app / full screen) and focus windows."
         ),
         "inputSchema": {
             "type": "object",
@@ -76,14 +82,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "switch_tab",
                         "close_tab",
                         "list_windows",
+                        "focus_window",
                         "set_mode",
                     ],
                     "default": "goto",
                 },
                 "url": {"type": "string", "description": "Target http/https URL for goto or new_tab."},
-                "tab_id": {"type": ["string", "integer"], "description": "Tab ID, index, or title/URL substring."},
-                "mode": {"type": "string", "enum": ["desktop", "managed"], "description": "Target mode for action='set_mode'."},
-                "hwnd": {"type": "integer", "description": "Optional desktop Chrome HWND for action='set_mode'."},
+                "tab_id": {"type": ["string", "integer"], "description": "Tab ID, index, or window title/process substring."},
+                "mode": {"type": "string", "enum": ["desktop", "managed", "os"], "description": "Target mode for action='set_mode'."},
+                "hwnd": {"type": "integer", "description": "Target window HWND for set_mode/focus_window (0 = full primary screen in mode='os')."},
+                "all_apps": {"type": "boolean", "default": False, "description": "When action='list_windows', also list all visible Windows desktop applications."},
                 "max_elements": {"type": "integer", "default": 45, "description": "Managed: cap returned elements."},
                 "max_text_chars": {"type": "integer", "default": 2500, "description": "Managed: cap text_excerpt."},
                 "detail": {"type": "string", "enum": ["brief", "full"], "default": "brief"},
@@ -96,7 +104,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "cua_act",
         "description": (
-            "Execute one GUI action via DOM element_id, OCR ocr_id/text_hint (0ms), action_json, or M3.5 visual grounding "
+            "Execute one GUI action via DOM element_id, OCR ocr_id/text_hint (0ms), action_json, or M4 visual grounding "
             "(with pixel+OCR effect verification, zoom self-healing on misses, optional wait_settle, and Red-tier guard)."
         ),
         "inputSchema": {
@@ -110,6 +118,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "strategy": {"type": "string", "enum": ["hybrid", "vision", "dom", "ocr"], "default": "hybrid"},
                 "auto_heal": {"type": "boolean", "default": True},
                 "wait_settle": {"type": "boolean", "default": False, "description": "Wait for page/frame stabilization and return updated text."},
+                "scroll_retry": {"type": "integer", "default": 0, "description": "Extra scroll-down-and-re-ground rounds when M3.5 reports not_found (0=off; search/scroll-worded instructions auto-enable 2). Model-initiated scroll actions always chain re-grounding up to 2 rounds."},
                 "include_text": {"type": "boolean", "default": False, "description": "Include post-action OCR/DOM text excerpt."},
                 "confirm_token": {"type": "string", "description": "One-time token after human confirms a Red-tier step."},
                 "include_screenshot": {"type": "boolean", "default": False},
@@ -153,6 +162,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                             "hotkey",
                                             "type",
                                             "scroll",
+                                            "drag",
                                         ],
                                     },
                                     "url": {"type": "string"},
@@ -180,6 +190,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                                     "wait_settle": {"type": "boolean"},
                                     "until_text": {"type": ["string", "array"]},
                                     "coordinate": {
+                                        "type": "array",
+                                        "items": {"type": "integer"},
+                                        "minItems": 2,
+                                        "maxItems": 2,
+                                    },
+                                    "end_coordinate": {
                                         "type": "array",
                                         "items": {"type": "integer"},
                                         "minItems": 2,
@@ -362,6 +378,7 @@ class MCPServerCore:
                 max_elements=int(a.get("max_elements", 45)),
                 max_text_chars=int(a.get("max_text_chars", 2500)),
                 detail=str(a.get("detail", "brief")),
+                all_apps=bool(a.get("all_apps", False)),
             ),
             "cua_act": lambda a: self.engine.act(
                 instruction=a.get("instruction"),
@@ -376,6 +393,7 @@ class MCPServerCore:
                 text_hint=a.get("text_hint"),
                 wait_settle=bool(a.get("wait_settle", False)),
                 include_text=bool(a.get("include_text", False)),
+                scroll_retry=int(a.get("scroll_retry", 0)),
             ),
             "cua_run_steps": lambda a: self.engine.run_steps(
                 steps=list(a["steps"]),
@@ -607,7 +625,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=18390)
     parser.add_argument("--vlm-port", type=int, default=18086)
     parser.add_argument("--profile-dir", type=Path, default=None)
-    parser.add_argument("--target-mode", choices=["managed", "desktop"], default="managed")
+    parser.add_argument("--target-mode", choices=["managed", "desktop", "os"], default="managed")
     parser.add_argument("--print-config", choices=["json", "codex"], help="Print the Stdio MCP client config for this checkout and exit.")
     args = parser.parse_args()
     if args.print_config:

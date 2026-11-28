@@ -1,6 +1,6 @@
 # Chrome CUA MCP
 
-给没有内置 computer use 的 agent / harness 用的 Chrome 操作工具：一个 MCP 服务，加一个本地 2B 视觉模型，加一个桌面悬浮窗。上层模型只收发文字，页面由本机来看、来点。
+给没有内置 computer use 的 agent / harness 用的桌面操作工具（支持 Chrome 与通用 Windows 桌面应用）：一个 MCP 服务（v0.3.0），加一个本地 2B 视觉模型，加一个桌面悬浮窗。上层模型只收发文字，页面由本机来看、来点。
 
 ![上层模型经 MCP 驱动隔离的 Chrome，随后在悬浮窗里下指令并被高危保护拦下](./assets/demo.gif)
 
@@ -8,18 +8,19 @@
 
 ## 它怎么工作
 
-- **两种目标**
+- **三种目标**
   - `managed`：独立配置目录的隔离 Chrome，通过 CDP 读 DOM、点元素。快，不碰你的日常浏览器。
   - `desktop`：你已经登录的本机 Chrome，用窗口截图、Windows 自带 OCR 和真实键鼠输入。
+  - `os`：通用 Windows 桌面模式，可枚举并切窗控制任意可见桌面应用窗口（如 QQ、资源管理器、IDE）或全主屏（`hwnd=0`），支持 `drag` 拖拽及 `F1`–`F12`、`home`、`end`、`pageup`/`pagedown` 等扩展快捷键；遇 Electron 黑帧自动回退区域截屏。
 - **文字优先**：能用 DOM 或 OCR 文字匹配的目标不调模型；默认不回传截图，返回体默认精简（`detail="brief"`）。
-- **本地模型兜底**：没有文字的图标、需要“看一眼”的问题，交给本机的 Qwen3.5-2B 微调模型（llama.cpp，约 2.3 GB 显存），只把坐标或一句话答案返回给上层。模型在第一次用到视觉时才加载。
+- **本地模型兜底**：没有文字的图标、需要“看一眼”的问题，交给本机的 Qwen3.5-2B 微调模型（`models/m4_gguf/` 优先，缺失时回退 `models/m35_gguf/`；llama.cpp，约 2.3 GB 显存），只把坐标或一句话答案返回给上层。模型在第一次用到视觉时才加载。
 - **批量执行**：`cua_run_steps` 一次调用最多跑 12 步，减少上层模型的往返轮次。
 - **保护**
   - 支付、下单、删除、转账等高危词（指令里出现，或定位到的目标上出现）会停下来等人确认，返回一次性 `confirm_token`。
-  - 登录页和人机验证直接交还给人。
-  - `desktop` 模式下 Chrome 不在前台就拒绝发送键鼠；把鼠标甩到屏幕左上角可急停。
+  - 登录页和人机验证直接交还给人（Human-in-the-Loop）。
+  - `desktop` / `os` 模式下目标窗口不在前台就拒绝发送键鼠（`hwnd=0` 全屏模式除外）；把鼠标甩到屏幕左上角可急停。
   - 带 `require_submit` 的提交步骤只认 URL 变化、明确的表单结果或你指定的新文字，输入框回显不算提交成功。
-- **悬浮窗**：平时只有一行输入；上层接入、执行进度、风险确认按需出现。也可以不经上层模型，直接在里面下单步指令。
+- **悬浮窗**：平时只有一行输入；上层接入、执行进度、12 秒无新动作自动收尾与玻璃风铃提示音（支持在 `assets/sounds/*.wav` 放置自定义音频）、风险确认按需出现。也可以不经上层模型，直接在里面下单步指令。
 
 ## 现状和边界
 
@@ -28,15 +29,15 @@
 | 项目 | 结果 | 说明 |
 | --- | --- | --- |
 | 托管模式一次观察 | 2–3 ms | 不截图时 |
-| 本地模型一次定位或读屏 | 约 0.5–0.7 s | 模型已加载；首次加载另需约 2–3 s，刚装完第一次用实测约 19 s（单次） |
+| 本地模型一次定位或读屏 | 约 0.5–0.7 s | 模型已加载（M4 实测约 0.63 s）；首次加载另需约 2–3 s，刚装完第一次用实测约 19 s（单次） |
 | 桌面模式 OCR | 约 0.7 s | 整窗 |
-| 自采真实 Chrome 留出集：点击落框 / 缺失目标拒识 | 103/120、80/80 | 与训练数据同批采集，偏乐观 |
-| Venus 中文定位题（没见过的页面）：点击落框 / 缺失目标拒识 | 105/240、22/80 | 泛化明显变差 |
-| 真实网站上纯视觉找链接 | 两轮 6/15、5/15 | 不执行点击，只比对坐标 |
+| CN500 线上同批 50 站（M3.5 → M4） | 64% → 74%（`vlm_qa` 5/8 → 8/8） | 双通道 SFT 后真实站点通过率 +10pp，上层均值约 5,904 tokens/例 |
+| `ask_screen` 未训练验证集（48 条，M3.5 → M4） | F1 0.216 → 0.581、长度合规 35% → 100% | 零 JSON 泄漏（0/48） |
+| 静态留出集 Real222 / Venus320（M3.5 → M4） | 97.7% → 96.4% / 80.3% → 78.8% | 唯一轻微退化在 `not_found`（M4 略更敢点），落框精度反升（103 → 107） |
 | Python 文档站内搜索并提交（托管模式） | 10/10 | 修复回车提交后复测 |
 
-- **适合**：上层模型负责拆任务和核对结果，本工具负责在托管 Chrome 里按 DOM 执行；需要看图时本地模型兜底；高危动作由人确认。
-- **不适合**：无人值守的长链任务；纯视觉操作陌生网站；拖拽、画图、滑块（动作协议里没有按住拖动）。
+- **适合**：上层模型负责拆任务和核对结果，本工具负责按 DOM/OCR 执行；需要看图定位或跨应用操作时本地 M4 模型兜底；高危动作由人确认。
+- **不适合**：无人值守的长链任务；纯视觉操作陌生网站；自动跳过登录门禁或人机验证（CAPTCHA）。
 - **没有验证过**：除 Codex、Antigravity 以外的 MCP 客户端；上层模型实际节省了多少 token；Windows 10 和其他显卡。
 - **视觉功能是可选的**：不装模型时，托管模式下按 DOM 操作网页照常可用；`cua_ask_screen`、`cua_locate` 和自然语言定位需要模型。
 
@@ -87,7 +88,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe .\scripts\chrome_cua_mcp.py --http --port 18390
 ```
 
-可选参数：`--target-mode managed|desktop`、`--profile-dir <目录>`（托管 Chrome 的配置目录，默认是项目下的 `profiles/cua_chrome`，里面有登录状态，已被 git 忽略）。
+可选参数：`--target-mode managed|desktop|os`、`--profile-dir <目录>`（托管 Chrome 的配置目录，默认是项目下的 `profiles/cua_chrome`，里面有登录状态，已被 git 忽略）。
 
 **接入上层模型**
 
@@ -110,10 +111,10 @@ HTTP 方式连接已经在运行的悬浮窗或 `--http` 服务，与安装位�
 
 | 工具 | 作用 |
 | --- | --- |
-| `cua_navigate` | 打开网址、前进后退、切换标签页，或切换 `managed` / `desktop`；返回标题、正文摘要和可点元素 |
-| `cua_observe` | 读当前页面：URL、标题、正文、可点元素（坐标为 0–1000 归一化）、是否遇到登录或验证码 |
+| `cua_navigate` | 打开网址、前进后退、切换标签页，枚举桌面窗口（`list_windows(all_apps=True)`）、聚焦窗口（`focus_window`）或切换 `managed` / `desktop` / `os`；返回标题、正文摘要和可点元素 |
+| `cua_observe` | 读当前页面或桌面窗口：URL、标题、正文、可点元素（坐标为 0–1000 归一化）、是否遇到登录或验证码 |
 | `cua_act` | 执行一步：按元素编号、OCR 编号、文字提示，或用自然语言交给本地模型定位 |
-| `cua_run_steps` | 一次最多 12 步的小计划：打开、点击并输入、滚动到、等待、提问等；遇到弹窗、高危动作、未观察到提交会停下并说明 |
+| `cua_run_steps` | 一次最多 12 步的小计划：打开、点击并输入、滚动到、等待、`drag` 拖拽、提问等；遇到弹窗、高危动作、未观察到提交会停下并说明 |
 | `cua_ask_screen` | 让本地模型回答一个关于当前画面的事实问题，只返回文字 |
 | `cua_locate` | 只预览本地模型的定位坐标，不发送任何输入 |
 | `cua_dismiss_popup` | 尝试关闭弹窗或横幅 |
@@ -141,12 +142,15 @@ HTTP 方式连接已经在运行的悬浮窗或 `--http` 服务，与安装位�
 
 ## 模型训练
 
-本地模型是 `Qwen/Qwen3.5-2B` 的 LoRA 微调（语言侧，监督微调），合并后导出为 GGUF（Q4_K_M）和配套的视觉投影文件。当前使用的一版（M3.5）训练集 4,148 条、验证集 645 条，来源是公开网页定位数据、自采的中文 Chrome 截图和困难负样本，在 Colab A100 上训练。输出是单行 JSON 动作（`left_click`、`type`、`scroll`、`not_found` 等，坐标 0–1000 归一化）。
+本地模型是 `Qwen/Qwen3.5-2B` 的 LoRA 微调（语言侧，监督微调），合并后导出为 GGUF（Q4_K_M）和配套的视觉投影文件。
+
+- **M3.5**：训练集 4,148 条、验证集 645 条，在 Colab A100 上训练，输出单行 JSON 动作（`left_click`、`type`、`scroll`、`not_found` 等，坐标 0–1000 归一化）。
+- **M4（双通道 SFT，当前默认）**：扩展至训练集 7,755 条、验证集 1,011 条（7 个数据源去重消歧），注入 `ask_screen` 短文本读屏问答样本（412 训练 / 48 验证）并保持动作 JSON 与纯文本问答零串台；在 Colab L4 上训练 486 步（`notebooks/M4_Colab_A100_Chrome_SFT.ipynb`），导出至 `models/m4_gguf/`。注：`setup.bat` 目前默认拉取已发布的 `m35-weights-v1` 权重包，若需使用 M4 可用上述 Notebook 自行导出或等待后续 `m4-weights-v1` Release。
 
 - [01_任务书_Chrome视觉鼠标操作模型.md](./01_任务书_Chrome视觉鼠标操作模型.md)：最初的工程任务书（动作空间、坐标与 DPI 链路、数据规范、验收标准）。项目后来从“纯视觉模型”转向“DOM 优先、模型兜底”，任务书保留作为背景。
 - [02_从YOLO到VLM后训练实战指南.md](./02_从YOLO到VLM后训练实战指南.md)、[03_LLM与VLM训练全景教学手册.md](./03_LLM与VLM训练全景教学手册.md)：写给有目标检测经验的人的 VLM 微调入门。
-- [notebooks/](./notebooks)：数据准备和 Colab 训练、导出用的 Notebook；由 `scripts/build_colab_notebooks.py`、`scripts/m3_train_colab.py`、`scripts/m35_build_notebook.py` 生成。
-- `scripts/m1_*`、`m3_*`、`m35_*`：采集、数据整理、离线对照和端到端评测脚本。训练数据包和评测原始结果不在仓库里；训练好的权重在 [Releases](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)。
+- [notebooks/](./notebooks)：数据准备和 Colab 训练、导出用的 Notebook；由 `scripts/build_colab_notebooks.py`、`scripts/m3_train_colab.py`、`scripts/m35_build_notebook.py`、`scripts/m4_build_notebook.py` 生成。
+- `scripts/m1_*`、`m3_*`、`m35_*`、`m4_*`、`teacher_*`、`benchmark_cn500.py`：采集、Teacher 数据组装、离线对照和 CN500 端到端评测脚本。训练数据包和评测原始结果不在仓库里；M3.5 权重在 [Releases](https://github.com/Assangejulian/chrome-cua-mcp/releases/tag/m35-weights-v1)。
 
 ## 目录
 

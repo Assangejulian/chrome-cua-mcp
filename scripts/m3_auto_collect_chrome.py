@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import queue
 import random
 import re
 import socket
@@ -542,7 +543,12 @@ class CDPClient:
 class UIAHelper:
     """Persistent DPI-aware PowerShell UIAutomation worker."""
 
+    _QUERY_TIMEOUT_S = 20.0
+
     def __init__(self) -> None:
+        self._spawn()
+
+    def _spawn(self) -> None:
         self.proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-Command", "-"],
             stdin=subprocess.PIPE,
@@ -554,15 +560,40 @@ class UIAHelper:
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.proc.stdin.write(UIA_PS_SCRIPT + "\n")
         self.proc.stdin.flush()
+        self._lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=self._pump_stdout, args=(self.proc, self._lines), daemon=True).start()
+
+    @staticmethod
+    def _pump_stdout(proc: subprocess.Popen, lines: "queue.Queue[str]") -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line)
 
     def query(self, hwnd: int, max_screen_y: int) -> list[dict[str, Any]]:
         assert self.proc.stdin is not None and self.proc.stdout is not None
-        self.proc.stdin.write(f"{hwnd},{max_screen_y}\n")
-        self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        try:
+            self.proc.stdin.write(f"{hwnd},{max_screen_y}\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            line = ""
+        else:
+            try:
+                line = self._lines.get(timeout=self._QUERY_TIMEOUT_S)
+            except queue.Empty:
+                line = ""
         if not line:
-            err = self.proc.stderr.read() if self.proc.stderr else ""
-            raise RuntimeError(f"UIA helper terminated unexpectedly: {err[:300]}")
+            err = ""
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            if self.proc.stderr:
+                try:
+                    err = self.proc.stderr.read() or ""
+                except Exception:
+                    pass
+            self._spawn()
+            raise RuntimeError(f"UIA helper unresponsive (restarted worker): {err[:300]}")
         parsed = json.loads(line)
         if isinstance(parsed, dict):
             if "error" in parsed:
